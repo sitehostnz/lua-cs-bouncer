@@ -18,6 +18,12 @@ local default_values = {
     ['REDIRECT_LOCATION'] = "",
     ['EXCLUDE_LOCATION'] = {},
     ['RET_CODE'] = 0,
+    -- Without a default, omitting the line leaves runtime.fallback nil, and the two
+    -- fallback branches in csmod.Allow() then set remediation to nil rather than to
+    -- a remediation - which matches no arm and lets the request through. 'ban' is
+    -- what loadConfig() already coerces an invalid value to, and is the fail-closed
+    -- choice.
+    ['FALLBACK_REMEDIATION'] = "ban",
     ['OVERRIDE_REMEDIATION'] = "",
     ['CAPTCHA_PROVIDER'] = "recaptcha",
     -- No ALTCHA_COST default on purpose. A default set here arrives at altcha.New()

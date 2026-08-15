@@ -763,14 +763,22 @@ function csmod.Allow(ip)
   -- appsec component returned. Applied before the fallback below, so forcing captcha
   -- while the captcha provider is misconfigured still degrades to FALLBACK_REMEDIATION.
   -- `or ""` so an absent key reads as "not set" rather than as "set to nil", which
-  -- would assign nil to remediation and match no arm below.
+  -- would assign nil to remediation and match no arm below. Not reachable while the
+  -- main config is always loaded with defaults, but the guard below it needed a
+  -- default added for exactly this shape, and the two should agree.
   if not ok and (runtime.conf["OVERRIDE_REMEDIATION"] or "") ~= "" then
     remediation = runtime.conf["OVERRIDE_REMEDIATION"]
   end
 
   if runtime.fallback ~= "" then
     -- if we can't use captcha, fallback
-    if remediation == "captcha" and captcha_ok == false then
+    -- `not captcha_ok` rather than `== false`: the flag lives in crowdsec_cache with
+    -- no TTL, alongside every decision, so it can be evicted under dict pressure. An
+    -- absent flag is nil, which is neither false nor usable, and without this the
+    -- captcha arm below is skipped too and the request falls through to DECLINED.
+    -- OVERRIDE_REMEDIATION=captcha rewrites every decision to captcha, so that
+    -- fail-open would otherwise reach bans as well.
+    if remediation == "captcha" and not captcha_ok then
       remediation = runtime.fallback
     end
 
