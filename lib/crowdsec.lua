@@ -123,7 +123,7 @@ function csmod.init(configFile, userAgent)
   end
 
   local captcha_ok = true
-  local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"])
+  local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"])
   if err ~= nil then
     ngx.log(ngx.ERR, "error loading captcha plugin: " .. err)
     captcha_ok = false
@@ -805,6 +805,30 @@ function csmod.Allow(ip)
               ngx.log(ngx.ERR, "Lua shared dict (crowdsec cache) is full, please increase dict size in config")
             end
 
+            -- Counterpart to the "Invalid captcha from" line below: without it a
+            -- solve is silent, so the logs show every failed attempt and nothing
+            -- that got through. How long the IP stays released explains the quiet
+            -- that follows, so it goes in the line too.
+            --
+            -- previous_uri comes from the Referer header on a non-GET request, so it
+            -- is attacker-chosen: keep it short and printable before it reaches the
+            -- log. nginx rejects raw newlines in headers, so this is about control
+            -- characters and length rather than forged log lines.
+            local logged_uri = (tostring(previous_uri):gsub("%c", "?"))
+            if #logged_uri > 200 then
+              logged_uri = logged_uri:sub(1, 200) .. "..."
+            end
+            -- The appsec branch above deleted the state instead of storing it, so
+            -- there is no CAPTCHA_EXPIRATION window to report there - that IP is
+            -- challenged again as soon as appsec next triggers.
+            local released_for = " until appsec triggers again"
+            if source ~= flag.APPSEC_SOURCE then
+              released_for = " for " .. runtime.conf["CAPTCHA_EXPIRATION"] .. "s"
+            end
+            ngx.log(ngx.ALERT, "[Crowdsec] '" .. ip .. "' solved the " ..
+              runtime.conf["CAPTCHA_PROVIDER"] .. " captcha, releasing to '" ..
+              logged_uri .. "'" .. released_for)
+
             -- captcha is valid, we redirect the IP to its previous URI using the GET method
             ngx.req.set_method(ngx.HTTP_GET)
             return ngx.redirect(previous_uri)
@@ -889,7 +913,10 @@ function csmod.Allow(ip)
                 ngx.log(ngx.ERR, "Lua shared dict (crowdsec cache) is full, please increase dict size in config")
               end
               ngx.log(ngx.ALERT, "[Crowdsec] denied '" .. ip .. "' with '"..remediation.."'")
-              captcha.apply()
+              -- ret_code goes with it so that if the captcha cannot be served and
+              -- this degrades to a ban, it carries the same status the ban arms
+              -- above would have used.
+              captcha.apply(ip, ret_code)
               return
           end
       end

@@ -31,6 +31,12 @@ jobs:
         apt-get install -y make gcc nginx libnginx-mod-http-lua perl ca-certificates luarocks
         luarocks install lua-cjson 2.1.0.10-1
         luarocks install lua-resty-http  0.17.1-0
+        # CAPTCHA_PROVIDER=altcha derives its own keys: resty.random and resty.string
+        # come from lua-resty-string, resty.openssl.* from lua-resty-openssl. Neither
+        # ships with nginx + lua-nginx-module, and both are pure-Lua FFI, so they need
+        # no build dependencies beyond what is installed above.
+        luarocks install lua-resty-string 0.09-0
+        luarocks install lua-resty-openssl 1.8.0-1
         cpan Test::Nginx
         cpan Test::Nginx::Socket
         echo "Installation done"
