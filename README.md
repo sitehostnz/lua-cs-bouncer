@@ -79,6 +79,13 @@ the first two is a 60 second solve, not the 90 seconds the widget itself allows:
 the bouncer holds the "owes us a captcha" state for 60s from serving the page, and a
 solution arriving later is answered with a fresh captcha page rather than a pass.
 
+> [!CAUTION]
+> `OVERRIDE_REMEDIATION=captcha` combined with this provider converts ban decisions
+> into a proof of work, which is a CPU cost rather than a human-presence test and is
+> straightforwardly scriptable — `t/25` does it in about forty lines of Perl with no
+> browser. One solve releases the address for the whole of `CAPTCHA_EXPIRATION`. See
+> the notes on that setting in [`config_example.conf`](config_example.conf).
+
 ### Custom captcha templates
 
 `templates/captcha.html` now renders the widget through `{{captcha_frontend_js_tag}}`
