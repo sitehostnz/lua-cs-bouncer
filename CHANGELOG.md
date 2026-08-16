@@ -39,6 +39,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `https://`), or falls back to the ban remediation when the page is not configured.
   Requests with `X-Forwarded-Proto: https` and localhost/loopback origins count as
   secure contexts and are served the captcha as normal. (#2)
+- Per-vhost template overrides: a server block can point the bouncer at its own
+  pages with `set $crowdsec_ban_template <path>;`, `set $crowdsec_captcha_template
+  <path>;` and `set $crowdsec_captcha_insecure_template <path>;`, following the
+  `$crowdsec_enable_bouncer` pattern. An unset variable or a missing file falls back
+  to the global template, files are read per serve so page edits apply without a
+  reload, and a captcha override without a `{{captcha_widget}}` slot degrades to the
+  stock captcha page rather than serving a widget nobody can solve. Override paths
+  containing `..` are refused, so a config that interpolates request data into the
+  path cannot be steered into a traversal. (#3)
 
 ### Fixed
 
