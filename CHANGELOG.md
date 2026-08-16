@@ -32,6 +32,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `FALLBACK_REMEDIATION`. (#2)
 - A solved captcha is now logged, including how long the address is released for;
   previously only failed attempts were logged. (#2)
+- Captcha decisions that arrive over plain HTTP are no longer served a widget the
+  browser cannot run: the bouncer serves the page named by the new
+  `CAPTCHA_INSECURE_TEMPLATE_PATH` setting (denied with the same status a ban would
+  carry; the stock `templates/captcha_insecure.html` asks the visitor to retry over
+  `https://`), or falls back to the ban remediation when the page is not configured.
+  Requests with `X-Forwarded-Proto: https` and localhost/loopback origins count as
+  secure contexts and are served the captcha as normal. (#2)
 
 ### Fixed
 

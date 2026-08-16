@@ -50,9 +50,10 @@ local ALTCHA_CHALLENGE_PLACEHOLDER = "__CROWDSEC_ALTCHA_CHALLENGE__"
 M.SecretKey = ""
 M.SiteKey = ""
 M.Template = ""
+M.InsecureTemplate = ""
 M.ret_code = ngx.HTTP_OK
 
-function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code, altcha_cost, altcha_algorithm, altcha_complexity)
+function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code, altcha_cost, altcha_algorithm, altcha_complexity, insecure_template_path)
 
     M.CaptchaProvider = captcha_provider
 
@@ -120,6 +121,23 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
         end
     end
 
+    -- Optional standalone page for captcha decisions that arrive over plain HTTP,
+    -- where the widget cannot run (see the secure-context gate in M.apply()). Loaded
+    -- raw rather than through the template engine: nothing per-provider belongs on
+    -- it, so there are no placeholders to fill. Unreadable is reported but does not
+    -- fail the provider - the page is a courtesy on top of the ban fallback, and
+    -- losing captcha over HTTPS to a typo here would be the worse trade.
+    M.InsecureTemplate = ""
+    if insecure_template_path ~= nil and insecure_template_path ~= "" then
+        if utils.file_exist(insecure_template_path) == true then
+            M.InsecureTemplate = utils.read_file(insecure_template_path) or ""
+        end
+        if M.InsecureTemplate == "" then
+            ngx.log(ngx.ERR, "CAPTCHA_INSECURE_TEMPLATE_PATH '" .. insecure_template_path ..
+                "' cannot be read, captcha decisions over plain HTTP will be served a ban instead")
+        end
+    end
+
     local template_data = {}
     -- still exported so templates written against the previous layout keep rendering
     template_data["captcha_site_key"] =  M.SiteKey
@@ -180,6 +198,30 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
     return nil
 end
 
+-- Whether the visitor's browser is plausibly in a secure context, as far as that
+-- can be judged from here: TLS on this hop, TLS terminated upstream and declared
+-- via X-Forwarded-Proto (e.g. Cloudflare Flexible), or a loopback / *.localhost
+-- origin, which browsers treat as secure whatever the scheme. The forwarded header
+-- and the Host are trusted unverified on purpose - this gate protects the visitor
+-- from an unusable widget, not the remediation from the visitor: forging either
+-- buys a bot nothing but the captcha page the gate would have spared it, and
+-- Validate() never consults the scheme at all.
+local function browser_context_is_secure()
+    if ngx.var.scheme == "https" then
+        return true
+    end
+    local forwarded_proto = ngx.var.http_x_forwarded_proto
+    if forwarded_proto ~= nil and forwarded_proto:lower() == "https" then
+        return true
+    end
+    -- the browser's own rule, not a heuristic: localhost, *.localhost and the
+    -- loopback literals are secure contexts, which is what keeps local development
+    -- over plain http on the captcha page rather than the denial below
+    local host = ngx.var.host
+    return host == "localhost" or utils.ends_with(host, ".localhost")
+        or host == "127.0.0.1" or host == "::1" or host == "[::1]"
+end
+
 -- ret_code is the status the appsec component asked for, or nil when the decision
 -- came from the LAPI. It is only consulted on the ban fallback below, so that
 -- serving a ban from here matches what csmod.Allow's own ban arms would have sent.
@@ -189,6 +231,37 @@ function M.apply(remote_ip, ret_code)
     -- headers already committed leaves the ban wearing them - harmless today, since
     -- nothing is flushed yet, but the wrong shape to leave for whoever adds the next
     -- header here.
+
+    -- A captcha enforced over plain HTTP strands a human visitor: altcha's widget
+    -- derives keys with crypto.subtle, which browsers expose only in secure
+    -- contexts, so it errors before doing any work. The gate applies to every
+    -- provider rather than special-casing altcha - a security check running over
+    -- plaintext is not worth much, and one behaviour is easier to reason about than
+    -- four. Checked before the challenge is minted so the visitor's mint budget is
+    -- not charged for a page they would never have been able to use.
+    if not browser_context_is_secure() then
+        if M.InsecureTemplate ~= "" then
+            ngx.log(ngx.ERR, "captcha for '" .. remote_ip ..
+                "' cannot run over plain HTTP, serving the insecure-context page instead")
+            -- the same status a ban would carry (RET_CODE, or the appsec status when
+            -- the decision came from there): this is a denial wearing a friendlier
+            -- face, and a 200 would invite caches to keep it
+            local status = ret_code
+            if status == nil then
+                status = ban.ret_code
+            end
+            ngx.header.content_type = "text/html"
+            ngx.header.cache_control = "no-cache"
+            ngx.status = status
+            ngx.say(M.InsecureTemplate)
+            ngx.exit(status)
+            return
+        end
+        ngx.log(ngx.ERR, "captcha for '" .. remote_ip ..
+            "' cannot run over plain HTTP and no insecure-context page is configured, serving a ban instead")
+        return ban.apply(ret_code)
+    end
+
     local challenge
     if M.CaptchaProvider == "altcha" then
         -- one challenge per visitor, so it cannot be baked into the template at

@@ -17,17 +17,20 @@ verifies itself. There is no third-party service to call and no account to hold,
 `SECRET_KEY` and `SITE_KEY` are ignored.
 
 > [!IMPORTANT]
-> **Visitors must reach the site over HTTPS.** The widget derives keys with
-> `crypto.subtle`, which browsers expose only in a secure context, and it throws
-> `Secure context (HTTPS) required.` before doing any work otherwise. On a plain
-> `http://` origin a challenged visitor is served a captcha they can never solve and
-> has no other route through, so altcha is the wrong provider for any site served
-> over HTTP — `CAPTCHA_PROVIDER` is set once per nginx instance, not per vhost.
+> **Visitors must reach the site over HTTPS to solve the captcha.** The widget
+> derives keys with `crypto.subtle`, which browsers expose only in a secure context,
+> and it throws `Secure context (HTTPS) required.` before doing any work otherwise.
+> The bouncer therefore never serves a captcha to a plain-`http://` request: it
+> serves the `CAPTCHA_INSECURE_TEMPLATE_PATH` page instead (the stock one asks the
+> visitor to retry over `https://`), or falls back to the ban remediation when that
+> page is not configured. Solving the captcha over HTTPS releases the address for
+> plain HTTP too.
 >
-> Two things this does *not* mean. Terminating TLS at an upstream proxy is fine —
-> what matters is the scheme the browser sees, not the one nginx sees. And
-> `http://localhost`, `http://127.0.0.1` and `http://[::1]` are themselves secure
-> contexts, so local development over plain HTTP works normally.
+> Two things still count as secure. Terminating TLS at an upstream proxy is fine —
+> what matters is the scheme the browser sees, not the one nginx sees, and
+> `X-Forwarded-Proto: https` is how the proxy says so. And `http://localhost`,
+> `*.localhost`, `http://127.0.0.1` and `http://[::1]` are themselves secure
+> contexts, so local development over plain HTTP is served the captcha as normal.
 
 It also needs two things the other providers do not, both outside `crowdsec.conf`:
 
