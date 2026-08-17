@@ -25,6 +25,14 @@ local csmod = {}
 
 local DENY = "deny"
 
+-- How long a served captcha page stays redeemable: the window between handing a
+-- visitor the page and accepting their solution. Was a bare 60 mid-function, which
+-- self-solving widgets rarely noticed but slow hardware did - the altcha work now
+-- starts as the page paints, and this is the whole budget it has to finish inside,
+-- so it is sized for a modest phone rather than a fast laptop. Kept well under
+-- altcha's 1200s challenge TTL so a re-served page still carries a live challenge.
+local CAPTCHA_VERIFY_TTL = 300
+
 local APPSEC_API_KEY_HEADER = "x-crowdsec-appsec-api-key"
 local APPSEC_IP_HEADER = "x-crowdsec-appsec-ip"
 local APPSEC_HOST_HEADER = "x-crowdsec-appsec-host"
@@ -122,18 +130,26 @@ function csmod.init(configFile, userAgent)
     ngx.log(ngx.ERR, "redirect location is set to '/' this will lead into infinite redirection")
   end
 
-  local captcha_ok = true
-  local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"], runtime.conf["CAPTCHA_INSECURE_TEMPLATE_PATH"])
-  if err ~= nil then
-    ngx.log(ngx.ERR, "error loading captcha plugin: " .. err)
-    captcha_ok = false
-  end
-  local succ, err, forcible = runtime.cache:set("captcha_ok", captcha_ok)
-  if not succ then
-    ngx.log(ngx.ERR, "failed to add captcha state key in cache: "..err)
-  end
-  if forcible then
-    ngx.log(ngx.ERR, "Lua shared dict (crowdsec cache) is full, please increase dict size in config")
+  -- Whether the captcha plugin configured successfully. Module state rather than a
+  -- crowdsec_cache entry: it is derived once from configuration, identical in every
+  -- worker (init_by_lua runs before workers fork) and never mutated after init, so
+  -- sharing bought nothing - and a dict entry can be evicted, which converted every
+  -- captcha decision into FALLBACK_REMEDIATION for the dict's remaining lifetime
+  -- the moment memory pressure pushed the flag out.
+  --
+  -- An empty CAPTCHA_PROVIDER= line is how a configuration says "no captcha here" -
+  -- the stock CrowdSec config ships exactly that shape - so it is stated once at
+  -- startup rather than reported as the error an unsupported value is.
+  runtime.captcha_ok = true
+  if (runtime.conf["CAPTCHA_PROVIDER"] or "") == "" then
+    runtime.captcha_ok = false
+    ngx.log(ngx.NOTICE, "CAPTCHA_PROVIDER is not set, captcha decisions will be served the fallback remediation")
+  else
+    local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"], runtime.conf["CAPTCHA_INSECURE_TEMPLATE_PATH"])
+    if err ~= nil then
+      ngx.log(ngx.ERR, "error loading captcha plugin: " .. err)
+      runtime.captcha_ok = false
+    end
   end
 
 
@@ -757,7 +773,7 @@ function csmod.Allow(ip)
     end
   end
 
-  local captcha_ok = runtime.cache:get("captcha_ok")
+  local captcha_ok = runtime.captcha_ok
 
   -- serve one remediation for every bounced decision, whatever type the LAPI or the
   -- appsec component returned. Applied before the fallback below, so forcing captcha
@@ -767,17 +783,22 @@ function csmod.Allow(ip)
   -- main config is always loaded with defaults, but the guard below it needed a
   -- default added for exactly this shape, and the two should agree.
   if not ok and (runtime.conf["OVERRIDE_REMEDIATION"] or "") ~= "" then
+    -- an appsec challenge arrives with a response body, headers and cookies the
+    -- challenge arm would forward; overriding it throws those away, which is
+    -- documented behaviour but should never be silent behaviour
+    if remediation == "challenge" and appsec_response ~= nil then
+      ngx.log(ngx.ERR, "[Crowdsec] OVERRIDE_REMEDIATION discards the appsec challenge response for '" .. ip .. "'")
+    end
     remediation = runtime.conf["OVERRIDE_REMEDIATION"]
   end
 
   if runtime.fallback ~= "" then
     -- if we can't use captcha, fallback
-    -- `not captcha_ok` rather than `== false`: the flag lives in crowdsec_cache with
-    -- no TTL, alongside every decision, so it can be evicted under dict pressure. An
-    -- absent flag is nil, which is neither false nor usable, and without this the
-    -- captcha arm below is skipped too and the request falls through to DECLINED.
-    -- OVERRIDE_REMEDIATION=captcha rewrites every decision to captcha, so that
-    -- fail-open would otherwise reach bans as well.
+    -- `not captcha_ok` rather than `== false`: nil (init never completed) and false
+    -- (provider unset or misconfigured) both mean there is no captcha to serve, and
+    -- either shape slipping past here would skip the captcha arm below too and let
+    -- the request fall through to DECLINED. OVERRIDE_REMEDIATION=captcha rewrites
+    -- every decision to captcha, so that fail-open would reach bans as well.
     if remediation == "captcha" and not captcha_ok then
       remediation = runtime.fallback
     end
@@ -909,7 +930,7 @@ function csmod.Allow(ip)
                   end
                 end
               end
-              local succ, err, forcible = ngx.shared.crowdsec_cache:set("captcha_"..ip, uri , 60, bit.bor(flag.VERIFY_STATE, remediationSource))
+              local succ, err, forcible = ngx.shared.crowdsec_cache:set("captcha_"..ip, uri , CAPTCHA_VERIFY_TTL, bit.bor(flag.VERIFY_STATE, remediationSource))
               if not succ then
                 ngx.log(ngx.ERR, "failed to add key about captcha for ip '" .. ip .. "' in cache: "..err)
               end

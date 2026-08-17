@@ -129,9 +129,9 @@ my $replay = $ua->request($post);
 fail("a solution was accepted twice - replay protection is not working")
     if $replay->code == 302;
 
-# A solve has to leave nothing behind in the altcha dict. The two challenge halves
-# going is what makes the replay above fail; the mint counter going is what stops an
-# honest visitor being charged for solving. That third one is not decoration - the
+# A solve has to leave nothing behind in the altcha dict. The challenge entry going
+# is what makes the replay above fail (it carries its own answer); the mint counter
+# going is what stops an honest visitor being charged for solving. That third one is not decoration - the
 # appsec path deletes the captcha state instead of storing a CAPTCHA_EXPIRATION
 # window, and CAPTCHA_EXPIRATION can be set below CHALLENGE_TTL, so a visitor can
 # legitimately be challenged many times inside one window. If solving did not refund
@@ -140,7 +140,7 @@ fail("a solution was accepted twice - replay protection is not working")
 # Read straight out of the shared dict rather than inferred from behaviour: the IP is
 # released for CAPTCHA_EXPIRATION at this point, so it cannot simply be challenged
 # again to find out.
-for my $prefix (qw(altcha_key_ altcha_challenge_ altcha_mints_)) {
+for my $prefix (qw(altcha_challenge_ altcha_mints_)) {
     my $key = $prefix . '3.3.3.3';
     my $probe = $ua->get("http://127.0.0.1:1984/_dict?key=$key");
     fail("could not read the altcha dict: HTTP " . $probe->code) unless $probe->is_success;

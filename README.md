@@ -14,7 +14,10 @@ This library is used by different bouncers :
 
 [ALTCHA](https://altcha.org) is a proof-of-work captcha that this bouncer issues and
 verifies itself. There is no third-party service to call and no account to hold, so
-`SECRET_KEY` and `SITE_KEY` are ignored.
+`SECRET_KEY` and `SITE_KEY` are ignored. One third-party dependency remains: the
+widget bundle is fetched from `cdn.jsdelivr.net` (version-pinned, with subresource
+integrity). A visitor who cannot reach the CDN is shown an explanatory message by
+the stock template rather than a blank form.
 
 > [!IMPORTANT]
 > **Visitors must reach the site over HTTPS to solve the captcha.** The widget
@@ -52,9 +55,10 @@ It also needs two things the other providers do not, both outside `crowdsec.conf
    lua_shared_dict crowdsec_altcha 10m;
    ```
 
-   Without it, outstanding challenges fall back to `crowdsec_cache` and compete with
-   CrowdSec's own decisions for space. If it is absent, a line is logged at `error`
-   level on startup — that is the level to filter on, despite it being advisory.
+   Without it, altcha refuses to configure and the bouncer degrades to
+   `FALLBACK_REMEDIATION` — refused rather than shared, because challenges are
+   attacker-paced writes, and letting them fall back into `crowdsec_cache` would let
+   a rotating source evict the decision cache the bouncer exists to enforce.
 
    Size it generously, because running out is worse than slow. Challenges are keyed by
    client IP and evicted LRU, and an IP whose challenge is evicted has to be issued a
@@ -64,23 +68,18 @@ It also needs two things the other providers do not, both outside `crowdsec.conf
    captcha and starts being served the ban page instead. Behind NAT or CGNAT, everyone
    on that address shares the outcome.
 
-   Budget about **900 bytes per outstanding challenge**, so the 10m above holds roughly
-   **11,500** concurrent ones. That is measured rather than derived from the payload,
-   and it is a good deal more than the payload suggests: one challenge is three separate
-   dict entries — the JSON, the derived key and the mint counter — and nginx's slab
-   allocator rounds each up to a power of two and adds a node header. A 228-byte
-   challenge costs about 900 bytes by the time all three are stored.
-
-   In `MODE=stream` there is a second cost: the periodic metrics refresh walks the
-   whole key set of `crowdsec_cache` with `get_keys(0)`, which locks the dict. Altcha's
-   keys are skipped, but only after being enumerated, so the fallback lengthens a call
-   that already blocks the worker.
+   Budget about **800 bytes per outstanding challenge**, so the 10m above holds roughly
+   **13,000** concurrent ones. That is more than the payload suggests: one challenge is
+   two dict entries — the JSON with its redeeming key prepended, and the mint counter —
+   and nginx's slab allocator rounds each up to a power of two and adds a node header,
+   so a ~300-byte challenge entry occupies a 512-byte slab before the counter is even
+   stored.
 
 Tuning (`ALTCHA_COST`, `ALTCHA_COMPLEXITY`, `ALTCHA_ALGORITHM`) is documented inline
-in [`config_example.conf`](config_example.conf). Note that the practical ceiling on
-the first two is a 60 second solve, not the 90 seconds the widget itself allows:
-the bouncer holds the "owes us a captcha" state for 60s from serving the page, and a
-solution arriving later is answered with a fresh captcha page rather than a pass.
+in [`config_example.conf`](config_example.conf). The practical ceiling on the first
+two is the widget's own 90 second solve timeout: the bouncer holds the "owes us a
+captcha" state for five minutes from serving the page, and solving starts as the
+page paints, so the widget gives up well before the bouncer does.
 
 > [!CAUTION]
 > `OVERRIDE_REMEDIATION=captcha` combined with this provider converts ban decisions
@@ -88,6 +87,11 @@ solution arriving later is answered with a fresh captcha page rather than a pass
 > straightforwardly scriptable — `t/25` does it in about forty lines of Perl with no
 > browser. One solve releases the address for the whole of `CAPTCHA_EXPIRATION`. See
 > the notes on that setting in [`config_example.conf`](config_example.conf).
+>
+> It also leaves `/favicon.ico` reachable for banned addresses: captcha decisions
+> have always exempted that path (the captcha page's own favicon request would
+> otherwise overwrite the address the visitor is released to), and the override
+> turns ban decisions into captcha decisions. Keep `/favicon.ico` a static file.
 
 ### Custom captcha templates
 

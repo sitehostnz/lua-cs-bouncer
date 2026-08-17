@@ -152,7 +152,6 @@ DEBUG CACHE:first_run:true
 DEBUG CACHE:metrics_first_run:false
 DEBUG CACHE:metrics_processed/ip_type=ipv4&:1
 DEBUG CACHE:metrics_all:processed/ip_type=ipv4&,
-DEBUG CACHE:captcha_ok:false
 DEBUG CACHE:first_run:true
 DEBUG CACHE:metrics_first_run:false
 DEBUG CACHE:startup:false
@@ -161,7 +160,6 @@ DEBUG CACHE:metrics_processed/ip_type=ipv4&:2
 DEBUG CACHE:decision_cache/ipv4_4294967295_16843009:ban/CAPI/ipv4
 DEBUG CACHE:metrics_dropped/ip_type=ipv4&origin=CAPI&:1
 DEBUG CACHE:metrics_all:processed/ip_type=ipv4&,dropped/ip_type=ipv4&origin=CAPI&,
-DEBUG CACHE:captcha_ok:false
 DEBUG CACHE:first_run:true
 DEBUG CACHE:metrics_first_run:false
 DEBUG CACHE:metrics_dropped/ip_type=ipv4&origin=CAPI&:1
@@ -170,5 +168,4 @@ DEBUG CACHE:startup:false
 DEBUG CACHE:refreshing:false
 DEBUG CACHE:metrics_processed/ip_type=ipv4&:3
 DEBUG CACHE:metrics_all:processed/ip_type=ipv4&,dropped/ip_type=ipv4&origin=CAPI&,
-DEBUG CACHE:captcha_ok:false
 --- wait: 1
