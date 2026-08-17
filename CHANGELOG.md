@@ -16,13 +16,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   [ALTCHA](https://altcha.org) proof-of-work captcha that the bouncer issues and checks
   itself, with no third-party service or account (`SITE_KEY` and `SECRET_KEY` are
   unused). It is tuned through the new `ALTCHA_COST`, `ALTCHA_COMPLEXITY` and
-  `ALTCHA_ALGORITHM` settings, requires the `lua-resty-string` and `lua-resty-openssl`
-  rocks, and optionally uses a dedicated `crowdsec_altcha` shared dict (without one,
-  challenges share `crowdsec_cache` with CrowdSec's own decisions). The widget is
-  pinned to `altcha@3.2.1` with subresource integrity, and visitors must reach the
-  site over HTTPS. The widget solves automatically as the page loads, with no click
-  needed. If a challenge cannot be issued, the visitor is served the ban page
-  rather than an unsolvable captcha. (#2)
+  `ALTCHA_ALGORITHM` settings, and requires the `lua-resty-string` and
+  `lua-resty-openssl` rocks plus a dedicated `crowdsec_altcha` shared dict — without
+  either it refuses to configure and degrades to `FALLBACK_REMEDIATION`, so challenge
+  churn can never evict CrowdSec's own decision cache. The widget is pinned to
+  `altcha@3.2.1` with subresource integrity and fetched from jsdelivr — a visitor who
+  cannot reach the CDN is shown an explanatory message rather than a blank form — and
+  solves automatically as the page loads, with no click needed. Visitors must reach
+  the site over HTTPS. If a challenge cannot be issued, the visitor is served the ban
+  page rather than an unsolvable captcha. (#2)
 - New template placeholders `{{captcha_frontend_js_tag}}` and `{{captcha_widget}}`,
   used by the stock `templates/captcha.html`. The previous placeholders are still
   populated, so custom templates keep working with the existing providers; altcha
@@ -41,11 +43,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Requests with `X-Forwarded-Proto: https` and localhost/loopback origins count as
   secure contexts and are served the captcha as normal. (#2)
 
+### Changed
+
+- `captcha.apply()` now takes `(remote_ip, ret_code)`; callers on the old
+  zero-argument form keep working, as a nil `remote_ip` falls back to the request
+  address. (#2)
+- The captcha verify window (between serving the page and accepting the solution)
+  is now 300 seconds rather than 60; with the widget solving on page load, the
+  widget's own 90 second timeout is the practical ceiling. (#2)
+- An empty `CAPTCHA_PROVIDER=` line is reported once at startup as "captcha not
+  configured" at notice level, rather than as an unsupported-provider error. (#2)
+- Serving the insecure-context page is logged at info level rather than error;
+  error is reserved for the case where no page is configured and a ban is served
+  instead. (#2)
+
 ### Fixed
 
-- A missing `captcha_ok` flag (for example, evicted from the shared dict under
-  pressure) now degrades captcha decisions to `FALLBACK_REMEDIATION` instead of
-  letting the request through. (#2)
+- The captcha-usability flag now lives in module state rather than the shared dict,
+  so it can no longer be evicted; previously an evicted flag let bounced requests
+  through, and once that was hardened to fail closed, an eviction silently converted
+  captcha to ban until reload. (#2)
+- Two concurrent first requests from one IP no longer mint two altcha challenges
+  with the second invalidating the first; the losing request now serves the winning
+  challenge. A challenge and the key that redeems it are stored as one atomic dict
+  entry, so no partial or mismatched state can exist. (#2)
+- `OVERRIDE_REMEDIATION` now logs when it discards an appsec challenge response
+  (body, headers and cookies) instead of dropping it silently. (#2)
 - `FALLBACK_REMEDIATION` now defaults to `ban` when the line is absent from the
   configuration; previously an absent line let the request through whenever the
   fallback path was taken. (#2)

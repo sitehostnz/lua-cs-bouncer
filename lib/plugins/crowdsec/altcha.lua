@@ -137,14 +137,16 @@ local MAX_COMPLEXITY = 1000000
 -- off mid-challenge should not come back to a dead page.
 local CHALLENGE_TTL = 1200
 
--- Two entries per outstanding challenge, both keyed by client IP: the JSON handed
--- to the widget, and the derived key that redeems it.
+-- One entry per outstanding challenge, keyed by client IP: the derived key that
+-- redeems it (fixed-width hex, KEY_LENGTH * 2 chars) with the JSON handed to the
+-- widget appended. One entry rather than two closes a family of races and partial
+-- states outright: there is no write ordering to get wrong, no half-evicted pair
+-- to detect, and claiming a challenge claims its answer atomically.
 local CHALLENGE_PREFIX = "altcha_challenge_"
-local KEY_PREFIX = "altcha_key_"
 -- Derivations spent by one IP in the current window. Accumulates across mints, and
--- is cleared by a solve or by its own TTL, whichever comes first - so unlike the two
--- above it can outlive the challenge that created it, which is the point: a client
--- that clears the pair some other way still cannot clear this.
+-- is cleared by a solve or by its own TTL, whichever comes first - so unlike the
+-- entry above it can outlive the challenge that created it, which is the point: a
+-- client that clears the challenge some other way still cannot clear this.
 local MINT_PREFIX = "altcha_mints_"
 
 -- How many derivations one IP may spend per CHALLENGE_TTL window before minting is
@@ -200,12 +202,11 @@ M.Cost = DEFAULT_COST
 M.Complexity = DEFAULT_COMPLEXITY
 M.Algorithm = DEFAULT_ALGORITHM
 
---- Shared dict holding issued challenges.
--- A dedicated dict keeps a burst of captcha pages from evicting CrowdSec's own
--- decision cache, but fall back to that cache so the module still works against
--- an nginx config that predates the dedicated dict.
+--- Shared dict holding issued challenges. M.New() refuses to configure without
+-- it, so by the time anything mints or validates this cannot be nil. Dedicated so
+-- a burst of captcha pages cannot evict CrowdSec's own decision cache.
 local function store()
-    return ngx.shared.crowdsec_altcha or ngx.shared.crowdsec_cache
+    return ngx.shared.crowdsec_altcha
 end
 
 --- Big-endian uint32, the counter encoding altcha uses by default ('uint32' mode).
@@ -308,16 +309,15 @@ end
 
 --- Validates configuration. Returns an error string, or nil when usable.
 function M.New(cost, algorithm, complexity)
-    -- First, and unconditionally. Every check below can return, and a missing dict is
-    -- the more consequential problem of the two - an operator with both a typo'd cost
-    -- and no dedicated dict should not be told only about the typo. Not fatal itself:
-    -- the fallback works, and refusing would take captcha away from an nginx config
-    -- that predates the dedicated dict.
+    -- Refused rather than advised. The old fallback shared crowdsec_cache with the
+    -- decision cache, and challenges are attacker-paced writes: every fresh bounced
+    -- address mints entries there, so a rotating source could churn the dict and
+    -- evict the very decisions the bouncer exists to enforce. Returning an error
+    -- degrades captcha to FALLBACK_REMEDIATION without stopping nginx, and the fix
+    -- is one line in the http block.
     if ngx.shared.crowdsec_altcha == nil then
-        ngx.log(ngx.ERR, "no 'crowdsec_altcha' shared dict declared, falling back to " ..
-            "'crowdsec_cache'. Add `lua_shared_dict crowdsec_altcha 10m;` to the nginx " ..
-            "http block: outstanding challenges otherwise compete with CrowdSec's own " ..
-            "decisions for that dict, and evicting them escalates captcha to ban.")
+        return "captcha provider 'altcha' needs its own shared dict: add " ..
+            "`lua_shared_dict crowdsec_altcha 10m;` to the nginx http block"
     end
 
     if algorithm ~= nil and algorithm ~= "" then
@@ -413,15 +413,11 @@ function M.Challenge(ip)
 
     local s = store()
 
-    -- Both halves have to still be there. They are written and removed together, but
-    -- they are two independent entries in the dict and eviction is per key, so one
-    -- can outlive the other - and the reads here bias which one that is, since this
-    -- promotes the challenge on every reload and never touches the key beside it.
-    -- Handing back a challenge whose answer is gone would leave the visitor solving
-    -- something that can no longer be redeemed.
+    -- The entry carries its own answer (key first, fixed width, challenge after),
+    -- so present means solvable - there is no torn pair to check for.
     local outstanding = s:get(CHALLENGE_PREFIX .. ip)
-    if outstanding ~= nil and s:get(KEY_PREFIX .. ip) ~= nil then
-        return outstanding, nil
+    if outstanding ~= nil then
+        return outstanding:sub(KEY_LENGTH * 2 + 1), nil
     end
 
     -- Counted before the work rather than after, so a derivation that fails still
@@ -471,16 +467,25 @@ function M.Challenge(ip)
         }
     })
 
-    -- Key first: a challenge that got handed out without its answer being stored
-    -- would be unsolvable, whereas an answer with no challenge beside it simply
-    -- goes unused and expires.
-    local ok, err, forcible = s:set(KEY_PREFIX .. ip, key_hex, CHALLENGE_TTL)
-    if ok then
-        -- keep the first write's `forcible`: it is the one that says the dict was
-        -- full, and letting the second write's value replace it loses that warning
-        -- whenever only the first had to evict something
-        local ok2, err2, forcible2 = s:set(CHALLENGE_PREFIX .. ip, challenge, CHALLENGE_TTL)
-        ok, err, forcible = ok2, err2, forcible or forcible2
+    -- add() rather than set(): two requests from one IP on parallel workers can
+    -- both miss the lookup above and both derive. With set() the second write
+    -- would overwrite the first, and whichever visitor was handed the first
+    -- challenge could never redeem it. With add() the loser of the race is told
+    -- so, and serves the winner's challenge instead - one wasted derivation,
+    -- nobody left holding a dead page. The entry being atomic is what makes this
+    -- complete: there is no window where a challenge exists without its answer.
+    local entry = key_hex .. challenge
+    local ok, err, forcible = s:add(CHALLENGE_PREFIX .. ip, entry, CHALLENGE_TTL)
+    if not ok and err == "exists" then
+        local theirs = s:get(CHALLENGE_PREFIX .. ip)
+        if theirs ~= nil then
+            return theirs:sub(KEY_LENGTH * 2 + 1), nil
+        end
+        -- gone again already: evicted between our add and that read. Take the slot
+        -- with our own pair - it is one atomic entry, so the worst case is the
+        -- racing visitor failing one solve against a replaced challenge and being
+        -- handed this one on their next load.
+        ok, err, forcible = s:set(CHALLENGE_PREFIX .. ip, entry, CHALLENGE_TTL)
     end
     if not ok then
         return nil, "failed to store altcha challenge: " .. tostring(err)
@@ -523,13 +528,15 @@ function M.Validate(payload, ip)
     -- Nothing in the payload is trusted to find the challenge: it is looked up by
     -- the IP we issued it to, so a caller cannot point the lookup somewhere else.
     local s = store()
-    local expected = s:get(KEY_PREFIX .. ip)
+    local entry = s:get(CHALLENGE_PREFIX .. ip)
 
-    if expected == nil then
+    if entry == nil then
         -- Expired, never issued, or already spent - indistinguishable, and all
         -- mean the visitor has to take a fresh challenge.
         return false, nil
     end
+    -- the answer rides in front of the challenge JSON, fixed width (see M.Challenge)
+    local expected = entry:sub(1, KEY_LENGTH * 2)
 
     -- Length first, so an oversized derivedKey is rejected before :lower() copies it
     if #solution.derivedKey ~= #expected or
@@ -552,7 +559,6 @@ function M.Validate(payload, ip)
     -- work was done, and should not be charged against the window: on the appsec
     -- path, and wherever CAPTCHA_EXPIRATION is shorter than CHALLENGE_TTL, an
     -- honest visitor is challenged again well inside it.
-    s:delete(KEY_PREFIX .. ip)
     s:delete(CHALLENGE_PREFIX .. ip)
     s:delete(MINT_PREFIX .. ip)
 

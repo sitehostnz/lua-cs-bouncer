@@ -264,3 +264,201 @@ Invalid captcha from 1.1.1.1
 Invalid captcha from 1.1.1.1
 Invalid captcha from 1.1.1.1
 Invalid captcha from 1.1.1.1
+
+
+
+=== TEST 23b: altcha refuses to configure without its shared dict
+
+No crowdsec_altcha dict in this block's http config. captcha.New() has to fail at
+init - challenges are attacker-paced writes, and the old fallback let them share
+crowdsec_cache with the decision cache they could then evict - leaving captcha
+unusable, so the captcha decision for 1.1.1.1 degrades to FALLBACK_REMEDIATION
+instead of silently writing challenges next to the decisions.
+
+--- main_config
+load_module /usr/share/nginx/modules/ndk_http_module.so;
+load_module /usr/share/nginx/modules/ngx_http_lua_module.so;
+
+--- http_config
+
+lua_package_path './lib/?.lua;;';
+lua_shared_dict crowdsec_cache 50m;
+lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
+init_by_lua_block
+{
+        cs = require "crowdsec"
+        local ok, err = cs.init("./t/conf_t/23_live_captcha_altcha_crowdsec_nginx_bouncer.conf", "crowdsec-nginx-bouncer/v1.0.8")
+        if ok == nil then
+                ngx.log(ngx.ERR, "[Crowdsec] " .. err)
+                error()
+        end
+        ngx.log(ngx.ALERT, "[Crowdsec] Initialisation done")
+}
+
+access_by_lua_block {
+        local cs = require "crowdsec"
+        cs.Allow(ngx.var.remote_addr)
+}
+
+server {
+    listen 8081;
+
+      location = /v1/decisions {
+            content_by_lua_block {
+            local args, err = ngx.req.get_uri_args()
+            if args.ip == "1.1.1.1" then
+               ngx.say('[{"duration":"1h00m00s","id":4091593,"origin":"CAPI","scenario":"crowdsecurity/vpatch-CVE-2024-4577","scope":"Ip","type":"captcha","value":"1.1.1.1"}]')
+            else
+               ngx.print('null')
+            end
+            }
+      }
+}
+
+--- config
+
+location = /t {
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("ok")
+    }
+}
+
+--- more_headers
+X-Forwarded-For: 1.1.1.1
+
+--- request
+GET /t
+
+--- error_code: 403
+--- error_log eval
+[
+"error loading captcha plugin: captcha provider 'altcha' needs its own shared dict",
+"[Crowdsec] denied '1.1.1.1' with 'ban'",
+]
+
+
+
+=== TEST 23c: the mint ceiling is reached through churn and degrades to a ban
+
+MAX_MINTS_PER_WINDOW is 10 per CHALLENGE_TTL, and reloads reuse the outstanding
+challenge, so the only way to spend the budget is the challenge going away between
+requests - eviction under dict pressure in production, a white-box delete here (the
+same trick t/25 uses to read the dict, because eviction cannot be provoked on
+demand). The eleventh mint has to be refused and served as a ban, not as a page
+whose challenge could never be issued.
+
+--- init
+
+use LWP::UserAgent;
+
+my $ua = LWP::UserAgent->new(timeout => 10);
+my $url = 'http://127.0.0.1:1984/t';
+
+open my $out_fh, '>', 't/servroot/logs/perl.init.log' or die $!;
+
+sub fail {
+    print $out_fh "$_[0]\n";
+    exit 1;
+}
+
+for my $mint (1 .. 10) {
+    my $req = HTTP::Request->new(GET => $url);
+    $req->header('X-Forwarded-For' => '1.1.1.1');
+    my $resp = $ua->request($req);
+    fail("mint $mint: expected the captcha page, got HTTP " . $resp->code)
+        unless $resp->code == 200 && $resp->decoded_content =~ /<altcha-widget/;
+
+    # evict the outstanding challenge so the next request has to mint afresh;
+    # the mint counter deliberately survives this
+    my $scrub = $ua->get('http://127.0.0.1:1984/_scrub');
+    fail("mint $mint: could not scrub the challenge: HTTP " . $scrub->code)
+        unless $scrub->is_success && $scrub->decoded_content eq 'scrubbed';
+}
+
+my $req = HTTP::Request->new(GET => $url);
+$req->header('X-Forwarded-For' => '1.1.1.1');
+my $resp = $ua->request($req);
+fail("11th mint: expected the ban page with 403, got HTTP " . $resp->code)
+    unless $resp->code == 403;
+
+print $out_fh "Ten mints served, the eleventh banned.\n";
+close $out_fh or warn "Could not close filehandle: $!";
+
+--- main_config
+load_module /usr/share/nginx/modules/ndk_http_module.so;
+load_module /usr/share/nginx/modules/ngx_http_lua_module.so;
+
+--- http_config
+
+lua_package_path './lib/?.lua;;';
+lua_shared_dict crowdsec_cache 50m;
+lua_shared_dict crowdsec_altcha 10m;
+lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
+init_by_lua_block
+{
+        cs = require "crowdsec"
+        local ok, err = cs.init("./t/conf_t/23_live_captcha_altcha_crowdsec_nginx_bouncer.conf", "crowdsec-nginx-bouncer/v1.0.8")
+        if ok == nil then
+                ngx.log(ngx.ERR, "[Crowdsec] " .. err)
+                error()
+        end
+        ngx.log(ngx.ALERT, "[Crowdsec] Initialisation done")
+}
+
+access_by_lua_block {
+        local cs = require "crowdsec"
+        cs.Allow(ngx.var.remote_addr)
+}
+
+server {
+    listen 8081;
+
+      location = /v1/decisions {
+            content_by_lua_block {
+            local args, err = ngx.req.get_uri_args()
+            if args.ip == "1.1.1.1" then
+               ngx.say('[{"duration":"1h00m00s","id":4091593,"origin":"CAPI","scenario":"crowdsecurity/vpatch-CVE-2024-4577","scope":"Ip","type":"captcha","value":"1.1.1.1"}]')
+            else
+               ngx.print('null')
+            end
+            }
+      }
+}
+
+--- config
+
+location = /t {
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("ok")
+    }
+}
+
+# Test-only white-box delete, probed without an X-Forwarded-For so it arrives as
+# 127.0.0.1 and the LAPI stub declines to bounce it.
+location = /_scrub {
+    content_by_lua_block {
+        ngx.shared.crowdsec_altcha:delete("altcha_challenge_1.1.1.1")
+        ngx.print("scrubbed")
+    }
+}
+
+--- more_headers
+X-Forwarded-For: 1.1.1.1
+
+--- request
+GET /t
+
+--- error_code: 403
+--- error_log eval
+[
+"altcha mint limit reached for 1.1.1.1 (10 per 1200s)",
+"failed to issue an altcha challenge, serving a ban instead",
+]

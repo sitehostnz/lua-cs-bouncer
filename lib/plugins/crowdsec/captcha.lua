@@ -229,6 +229,14 @@ end
 -- came from the LAPI. It is only consulted on the ban fallback below, so that
 -- serving a ban from here matches what csmod.Allow's own ban arms would have sent.
 function M.apply(remote_ip, ret_code)
+    -- This library is packaged by several bouncers, and apply() took no arguments
+    -- before the altcha work - a caller still on that signature passes nil, and
+    -- the log concatenations below would turn its captcha decision into a 500 out
+    -- of the access phase. The request's address is the value it meant anyway.
+    if remote_ip == nil then
+        remote_ip = ngx.var.remote_addr
+    end
+
     -- Anything that can decide not to serve a captcha page has to happen before the
     -- first header is set. Handing off to ban.apply() with captcha's status and
     -- headers already committed leaves the ban wearing them - harmless today, since
@@ -244,7 +252,11 @@ function M.apply(remote_ip, ret_code)
     -- not charged for a page they would never have been able to use.
     if not browser_context_is_secure() then
         if M.InsecureTemplate ~= "" then
-            ngx.log(ngx.ERR, "captcha for '" .. remote_ip ..
+            -- INFO, not ERR: on a site serving plain HTTP this is the routine
+            -- outcome for every bounced request, and a bot hammering one endpoint
+            -- must not be able to bury genuine errors. The no-page branch below
+            -- stays at ERR because it reflects configuration worth changing.
+            ngx.log(ngx.INFO, "captcha for '" .. remote_ip ..
                 "' cannot run over plain HTTP, serving the insecure-context page instead")
             -- the same status a ban would carry (RET_CODE, or the appsec status when
             -- the decision came from there): this is a denial wearing a friendlier
