@@ -61,13 +61,14 @@ if ($content !~ /<title>CrowdSec Captcha<\/title>/i) {
 }
 
 # the widget must name its hidden input to match GetCaptchaBackendKey(), and must
-# carry no auto attribute: the visitor clicks to solve, the page does not do it
+# carry auto="onload": solving starts as the page paints, so the visitor's whole
+# 60s verify window is spent on the work rather than on noticing a button
 if ($content !~ m{<altcha-widget id="captcha" name="altcha-response"}) {
     print $out_fh "altcha-widget missing, or not renaming its hidden field\n";
     exit 1;
 }
-if ($content =~ m{<altcha-widget[^>]*\bauto=}) {
-    print $out_fh "altcha-widget is set to solve itself\n";
+if ($content !~ m{<altcha-widget[^>]*\bauto="onload"}) {
+    print $out_fh "altcha-widget is not set to solve on load\n";
     exit 1;
 }
 
