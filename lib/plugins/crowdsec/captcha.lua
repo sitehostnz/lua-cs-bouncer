@@ -151,13 +151,16 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
             '<script async defer type="module" src="' .. captcha_frontend_js["altcha"] ..
             '" integrity="' .. captcha_frontend_js_integrity["altcha"] ..
             '" crossorigin="anonymous"></script>'
-        -- No auto attribute, so the widget waits to be clicked rather than solving
-        -- as the page paints - the same deliberate act the other providers ask for.
+        -- auto="onload", so solving starts as the page paints instead of waiting
+        -- for a click. The bouncer only holds the verify state for 60s from serving
+        -- the page, and the click was never a bot barrier - the proof of work is
+        -- the gate, and t/25 pays it with no browser at all - so a click bought no
+        -- security and spent the visitor's solve window on noticing a button.
         -- The challenge itself is per-visitor, so a placeholder stands in here and
         -- M.apply() splices the visitor's own in.
         template_data["captcha_widget"] =
             '<altcha-widget id="captcha" name="' .. M.GetCaptchaBackendKey() ..
-            '" challenge=\'' .. ALTCHA_CHALLENGE_PLACEHOLDER .. '\'></altcha-widget>' ..
+            '" challenge=\'' .. ALTCHA_CHALLENGE_PLACEHOLDER .. '\' auto="onload"></altcha-widget>' ..
             -- wrapped in a function so captchaCallback resolves when the event fires
             -- rather than while this script is parsed: it is declared further down
             '<script>document.getElementById("captcha")' ..

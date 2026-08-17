@@ -20,7 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   rocks, and optionally uses a dedicated `crowdsec_altcha` shared dict (without one,
   challenges share `crowdsec_cache` with CrowdSec's own decisions). The widget is
   pinned to `altcha@3.2.1` with subresource integrity, and visitors must reach the
-  site over HTTPS. If a challenge cannot be issued, the visitor is served the ban page
+  site over HTTPS. The widget solves automatically as the page loads, with no click
+  needed. If a challenge cannot be issued, the visitor is served the ban page
   rather than an unsolvable captcha. (#2)
 - New template placeholders `{{captcha_frontend_js_tag}}` and `{{captcha_widget}}`,
   used by the stock `templates/captcha.html`. The previous placeholders are still
