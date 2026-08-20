@@ -20,11 +20,14 @@
           {{captcha_widget}}
         </form>
         <!-- Revealed only if an altcha widget is on the page but its script never
-             arrived (CDN blocked or unreachable): without this, that failure is a
-             blank form with no route forward and nothing to act on. -->
+             arrived - blocked, unreachable, or misconfigured when self-hosted.
+             Without this, that failure is a blank form with no route forward and
+             nothing to act on. Deliberately names no host: which one is involved
+             depends on ALTCHA_WIDGET_PATH, and guessing wrong sends the visitor
+             chasing a CDN they are not using. The server log names it instead. -->
         <p id="captcha-unavailable" class="text-sm" hidden>
-          The verification widget could not be loaded — your network may be blocking
-          <code>cdn.jsdelivr.net</code>. Please retry shortly, or from another network.
+          The verification widget could not be loaded. Please retry shortly, or from
+          another network.
         </p>
         <script>
           setTimeout(function () {

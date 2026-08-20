@@ -52,8 +52,12 @@ M.SiteKey = ""
 M.Template = ""
 M.InsecureTemplate = ""
 M.ret_code = ngx.HTTP_OK
+-- Set together, or not at all: the URL path the widget bundle is served at, and
+-- the bundle itself, held in memory from init. See the widget block in M.New().
+M.WidgetPath = ""
+M.WidgetBody = ""
 
-function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code, altcha_cost, altcha_algorithm, altcha_complexity, insecure_template_path)
+function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code, altcha_cost, altcha_algorithm, altcha_complexity, insecure_template_path, widget_file, widget_path)
 
     M.CaptchaProvider = captcha_provider
 
@@ -107,6 +111,46 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
       end
     end
 
+    -- Optional self-hosted widget bundle, which removes the only third party left
+    -- in this provider: by default the browser fetches altcha.js from a CDN, and a
+    -- visitor whose network cannot reach it is served a captcha with no widget.
+    -- Held in memory and answered from M.ServeWidget() rather than by a location
+    -- block, so one http-level access_by_lua_block covers every vhost.
+    --
+    -- Both keys or neither. The path is what the script tag advertises and what
+    -- ServeWidget() answers, so one without the other either points the browser at
+    -- a URL nothing serves, or serves a URL nothing asks for.
+    --
+    -- Unusable is reported and falls back to the CDN rather than failing the
+    -- provider: a visitor who can reach jsdelivr is better off than one served a
+    -- captcha page with no widget on it at all.
+    M.WidgetPath = ""
+    M.WidgetBody = ""
+    local widget_wanted = (widget_file ~= nil and widget_file ~= "") or
+                          (widget_path ~= nil and widget_path ~= "")
+    if M.CaptchaProvider == "altcha" and widget_wanted then
+        if widget_file == nil or widget_file == "" or widget_path == nil or widget_path == "" then
+            ngx.log(ngx.ERR, "ALTCHA_WIDGET_FILE and ALTCHA_WIDGET_PATH must be set together, " ..
+                "serving the widget from the CDN instead")
+        elseif utils.starts_with(widget_path, "/") == false then
+            -- compared against ngx.var.uri, which is always absolute, so a
+            -- relative path here would simply never match
+            ngx.log(ngx.ERR, "ALTCHA_WIDGET_PATH '" .. widget_path .. "' must start with '/', " ..
+                "serving the widget from the CDN instead")
+        else
+            local body = utils.read_file_bytes(widget_file)
+            if body == nil or body == "" then
+                ngx.log(ngx.ERR, "ALTCHA_WIDGET_FILE '" .. widget_file .. "' cannot be read, " ..
+                    "serving the widget from the CDN instead")
+            else
+                M.WidgetPath = widget_path
+                M.WidgetBody = body
+                ngx.log(ngx.NOTICE, "serving the altcha widget from '" .. widget_path ..
+                    "' (" .. #body .. " bytes), not from the CDN")
+            end
+        end
+    end
+
     local ret_code_ok = false
     if ret_code ~= nil and ret_code ~= 0 and ret_code ~= "" then
         for k, v in pairs(utils.HTTP_CODE) do
@@ -147,10 +191,20 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
     -- providers disagree on how the widget is loaded and declared, and the template
     -- engine has no conditionals, so the markup is rendered here and injected whole
     if M.CaptchaProvider == "altcha" then
-        template_data["captcha_frontend_js_tag"] =
-            '<script async defer type="module" src="' .. captcha_frontend_js["altcha"] ..
-            '" integrity="' .. captcha_frontend_js_integrity["altcha"] ..
-            '" crossorigin="anonymous"></script>'
+        if M.WidgetPath ~= "" then
+            -- No integrity and no crossorigin: the bundle comes from this origin
+            -- now, so there is no third party to distrust, and the file is verified
+            -- where it is fetched rather than in the browser. A hash pinned here
+            -- would also have to match whatever the operator deployed, and a
+            -- mismatch fails silently - the element never upgrades.
+            template_data["captcha_frontend_js_tag"] =
+                '<script async defer type="module" src="' .. M.WidgetPath .. '"></script>'
+        else
+            template_data["captcha_frontend_js_tag"] =
+                '<script async defer type="module" src="' .. captcha_frontend_js["altcha"] ..
+                '" integrity="' .. captcha_frontend_js_integrity["altcha"] ..
+                '" crossorigin="anonymous"></script>'
+        end
         -- auto="onload", so solving starts as the page paints instead of waiting
         -- for a click. The bouncer only holds the verify state for 60s from serving
         -- the page, and the click was never a bot barrier - the proof of work is
@@ -199,6 +253,36 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
     end
 
     return nil
+end
+
+--- Answers a request for the self-hosted widget bundle.
+-- Returns false when this request is not for it; does not return at all when it
+-- is, having served the bundle. Called from csmod.Allow() before any remediation,
+-- which matters for two reasons beyond covering every vhost from one place:
+--
+--   * the script is fetched by a browser whose address is being captcha'd, and
+--     every request from such an address is otherwise answered with the captcha
+--     page. The browser would receive HTML where it expected a module, and the
+--     element would never upgrade.
+--   * serving the captcha page also rewrites the URI the visitor is released to
+--     once they solve. A bounced subresource fetch would send them to the script
+--     instead of the page they asked for - the same trap /favicon.ico is exempt
+--     from in csmod.Allow().
+function M.ServeWidget()
+    if M.WidgetPath == "" or ngx.var.uri ~= M.WidgetPath then
+        return false
+    end
+
+    ngx.header.content_type = "application/javascript; charset=utf-8"
+    -- Cached hard, because the path is expected to carry the version (the shipped
+    -- configuration names the file altcha-<version>.js): a new bundle then arrives
+    -- under a new URL instead of as a revalidation of this one.
+    ngx.header.cache_control = "public, max-age=31536000, immutable"
+    ngx.status = ngx.HTTP_OK
+    -- print, not say: say appends a newline, and this is a byte-exact copy of a
+    -- file whose checksum the operator may well be checking
+    ngx.print(M.WidgetBody)
+    ngx.exit(ngx.HTTP_OK)
 end
 
 -- Whether the visitor's browser is plausibly in a secure context, as far as that

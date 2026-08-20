@@ -145,7 +145,7 @@ function csmod.init(configFile, userAgent)
     runtime.captcha_ok = false
     ngx.log(ngx.NOTICE, "CAPTCHA_PROVIDER is not set, captcha decisions will be served the fallback remediation")
   else
-    local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"], runtime.conf["CAPTCHA_INSECURE_TEMPLATE_PATH"])
+    local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"], runtime.conf["CAPTCHA_INSECURE_TEMPLATE_PATH"], runtime.conf["ALTCHA_WIDGET_FILE"], runtime.conf["ALTCHA_WIDGET_PATH"])
     if err ~= nil then
       ngx.log(ngx.ERR, "error loading captcha plugin: " .. err)
       runtime.captcha_ok = false
@@ -712,6 +712,12 @@ end
 -- the function is called from nginx access_by_lua_block
 -- @param ip the IP to check
 function csmod.Allow(ip)
+  -- Before anything else, including the enabled checks and the location
+  -- exclusions: this serves the bouncer's own self-hosted captcha widget, and a
+  -- request for it must never be bounced (see captcha.ServeWidget). It is a no-op
+  -- unless ALTCHA_WIDGET_FILE and ALTCHA_WIDGET_PATH are both configured.
+  captcha.ServeWidget() -- serves the bundle and exits when the URI matches
+
   local remediationSource = flag.BOUNCER_SOURCE
   local ret_code = nil
   local remediation = ""
