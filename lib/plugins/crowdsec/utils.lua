@@ -29,6 +29,20 @@ function M.read_file(path)
    return content:sub(1,-2)
  end
 
+--- Reads a file whole, byte for byte. M.read_file() above drops the final
+--- character, which suits the templates it was written for and would corrupt
+--- anything else - a script bundle that happens not to end in a newline loses the
+--- semicolon or brace that terminates it.
+function M.read_file_bytes(path)
+   local file = io.open(path, "rb")
+   if not file then
+      return nil
+   end
+   local content = file:read("*a")
+   file:close()
+   return content
+end
+
 function M.file_exist(path)
  if path == nil then
    return nil

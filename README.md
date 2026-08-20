@@ -14,10 +14,12 @@ This library is used by different bouncers :
 
 [ALTCHA](https://altcha.org) is a proof-of-work captcha that this bouncer issues and
 verifies itself. There is no third-party service to call and no account to hold, so
-`SECRET_KEY` and `SITE_KEY` are ignored. One third-party dependency remains: the
-widget bundle is fetched from `cdn.jsdelivr.net` (version-pinned, with subresource
-integrity). A visitor who cannot reach the CDN is shown an explanatory message by
-the stock template rather than a blank form.
+`SECRET_KEY` and `SITE_KEY` are ignored. By default one third-party dependency
+remains — the widget bundle is fetched from `cdn.jsdelivr.net`, version-pinned with
+subresource integrity — and `ALTCHA_WIDGET_FILE`/`ALTCHA_WIDGET_PATH` remove even
+that by serving the bundle yourself (see below). Either way, a visitor whose browser
+never receives the script is shown an explanatory message by the stock template
+rather than a blank form.
 
 > [!IMPORTANT]
 > **Visitors must reach the site over HTTPS to solve the captcha.** The widget
@@ -92,6 +94,32 @@ page paints, so the widget gives up well before the bouncer does.
 > have always exempted that path (the captcha page's own favicon request would
 > otherwise overwrite the address the visitor is released to), and the override
 > turns ban decisions into captcha decisions. Keep `/favicon.ico` a static file.
+
+### Self-hosting the widget
+
+```
+ALTCHA_WIDGET_FILE=/var/lib/crowdsec/lua/assets/altcha-3.2.1.js
+ALTCHA_WIDGET_PATH=/.crowdsec/altcha-3.2.1.js
+```
+
+Set both and the bouncer reads the bundle once at startup and serves it from that
+path itself, with a year of immutable caching; the captcha page's script tag then
+points there instead of at the CDN, without an `integrity` attribute — a page served
+from your own origin has no third party left to distrust, and a stale hash would fail
+silently. Set one without the other, or name a file that cannot be read, and the pair
+is ignored with a line in the log and the CDN copy is used instead.
+
+Verify the bundle where you fetch it (a checksum in your image build, say) rather
+than in the browser, and put the version in the path so a new bundle arrives under a
+new URL.
+
+The bundle is served from the access phase, before any remediation runs. That is
+what makes it work on **every vhost with no location block**, and it is also
+required rather than merely convenient: the script is fetched by an address that is
+being captcha'd, so any other handling would answer it with the captcha page —
+arriving as HTML where the browser expects a module, and rewriting the URI the
+visitor is released to, so solving would drop them on the `.js` file instead of the
+page they asked for. No `EXCLUDE_LOCATION` entry is needed.
 
 ### Custom captcha templates
 

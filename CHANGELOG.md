@@ -20,11 +20,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `lua-resty-openssl` rocks plus a dedicated `crowdsec_altcha` shared dict — without
   either it refuses to configure and degrades to `FALLBACK_REMEDIATION`, so challenge
   churn can never evict CrowdSec's own decision cache. The widget is pinned to
-  `altcha@3.2.1` with subresource integrity and fetched from jsdelivr — a visitor who
-  cannot reach the CDN is shown an explanatory message rather than a blank form — and
+  `altcha@3.2.1` with subresource integrity and fetched from jsdelivr by default (see
+  `ALTCHA_WIDGET_FILE` below to serve it yourself) — a visitor whose browser never
+  receives the script is shown an explanatory message rather than a blank form — and
   solves automatically as the page loads, with no click needed. Visitors must reach
   the site over HTTPS. If a challenge cannot be issued, the visitor is served the ban
   page rather than an unsolvable captcha. (#2)
+- New `ALTCHA_WIDGET_FILE` and `ALTCHA_WIDGET_PATH` settings serve the altcha widget
+  bundle from the bouncer itself instead of jsdelivr, removing the provider's last
+  third-party dependency: a visitor who cannot reach the CDN was otherwise served a
+  captcha with no widget on it. The bundle is read once at startup and answered from
+  the access phase, so it covers every vhost with no location block and is never
+  bounced — a captcha'd address fetching the script would otherwise receive the
+  captcha page, and be released to the script rather than to the page it asked for.
+  Setting only one of the two, or naming an unreadable file, logs and falls back to
+  the CDN. (#2)
 - New template placeholders `{{captcha_frontend_js_tag}}` and `{{captcha_widget}}`,
   used by the stock `templates/captcha.html`. The previous placeholders are still
   populated, so custom templates keep working with the existing providers; altcha
