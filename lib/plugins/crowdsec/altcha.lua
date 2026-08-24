@@ -76,6 +76,10 @@ local M = {_TYPE='module', _NAME='altcha.funcs', _VERSION='1.0-0'}
 -- nowhere in it, so a browser given one would never find a solver. They are
 -- deliberately absent here rather than accepted and quietly unsolvable.
 --
+-- This list is pinned to that bundle, and the bundle's URL and its SRI hash live in
+-- captcha.lua. All three move together: bumping the version means checking this
+-- table as well as the two constants over there.
+--
 -- `kind` selects how a key is derived, mirroring the widget:
 --   pbkdf2 - src/algorithms/pbkdf2.ts, one PBKDF2 pass of `cost` iterations
 --   sha    - src/algorithms/sha.ts, `cost` rounds of digest over the previous key
@@ -163,6 +167,84 @@ local MINT_PREFIX = "altcha_mints_"
 -- while an unbounded count is one blocking KDF pass per request on a worker that
 -- cannot yield during it.
 local MAX_MINTS_PER_WINDOW = 10
+
+-- The per-IP ceiling above is keyed on the exact address, which is how it is evaded
+-- rather than reached: a rotating source gets a fresh counter every time. Nothing
+-- bounded the aggregate, and each mint is one blocking, non-yielding derivation on the
+-- worker handling it - measured at 0.76 ms at the default ALTCHA_COST of 5000 and
+-- 14.2 ms at MAX_COST. OVERRIDE_REMEDIATION=captcha widens who mints from "addresses carrying a
+-- captcha decision" to every address in the blocklist that sends a request, so the
+-- distinct-address arrival rate is attacker-chosen.
+--
+-- So bound the aggregate too, and bound it in TIME rather than in mints: a count is
+-- meaningless without knowing what a mint costs, and that varies ~20x between the
+-- PBKDF2 and SHA families and ~6x with whether the host has SHA-NI. M.New() already
+-- runs one real derivation to check the rocks work; timing it converts this into a
+-- self-calibrating budget that needs no new config option and no guessed constant.
+--
+-- 50 ms per worker per second is 5% of each worker spent deriving, so the budget grows
+-- with the host rather than being a figure that is generous on 16 cores and crippling
+-- on two. Above it, Challenge() refuses, captcha.apply() degrades to ban.apply(), and a
+-- flood gets ban pages - the same fail-closed direction the per-IP ceiling already takes.
+--
+-- What 5% does NOT do is leave the worker idle for real traffic, and an earlier draft of
+-- this comment claimed it did. Under a flood the worker saturates either way: measured
+-- at 0.90 cores with the budget on and 0.94 without, on one worker. What changes is what
+-- the core buys - 2,979 requests a second served instead of 1,030, because a refusal
+-- costs a fraction of a derivation - and how long any single operation blocks, which is
+-- what keeps the queue behind it short. Treat this as a latency and fairness control,
+-- not a capacity saving, when sizing a deployment.
+--
+-- The scaling assumes one usable core per worker. That holds where worker_processes
+-- matches the cores actually available, which is the case with `auto` on an unrestricted
+-- host. It does not hold under a CFS quota: nginx sets `auto` from the machine's online
+-- CPU count, which sees neither a cgroup quota nor an affinity mask, so a container
+-- capped below its host's core count gets the host's worth of workers and a budget
+-- over-allocated by host_cores/limit. Verified: 12 workers and a 600 ms budget inside a
+-- 1-CPU container on a 12-core host, where 5% would be 50 ms. If a CPU limit is ever
+-- introduced, derive the budget from the quota rather than from ngx.worker.count().
+--
+-- What it bounds is derivation, which is the part that scales with ALTCHA_COST and the
+-- part with no other limit on it. The rest of a mint - hex, JSON, one dict write - is
+-- fixed work that a request pays whether or not it mints, and the probe does not time
+-- it. So the budget is accurate where the derivation dominates (measured within 6% of a
+-- real mint at cost 5000, exact at MAX_COST) and up to ~4x generous at a cost as low as
+-- 100, where 0.02 ms of derivation sits inside a 0.07 ms mint. That is the safe
+-- direction - a generous bound refuses nothing it should have served - and at costs
+-- that low the absolute time is small regardless.
+local MINT_BUDGET_MS_PER_WORKER_SECOND = 50
+local MINT_BUDGET_PREFIX = "altcha_mint_budget_"
+
+-- Refusals arrive at exactly the rate the flood does - measured at ~3,700 a second on
+-- one worker - and the caller logs each one at ERR. Left alone that trades blocking
+-- derivation for blocking writes, which is not the trade the budget is for. So the
+-- refusal tells the caller whether it has already been reported for this second, and
+-- the caller stays quiet when it has. One line per worker per second, carrying the
+-- count, rather than one per request.
+--
+-- Deliberately per worker rather than shared through the dict: the shared counter would
+-- give one line per second for the whole process, and each worker's event loop is its
+-- own story. Bounded either way - workers are few.
+local budget_reported_second = nil
+
+-- Calibration samples whole mints, because a mint is the unit being budgeted and
+-- derive_key() reads M.Cost internally - there is no per-round handle to measure and
+-- scale up. One mint at a low cost is far below ngx.now()'s millisecond resolution, so
+-- the probe keeps minting until it has accumulated a span the clock can actually
+-- resolve, then divides. PROBE_MIN_MS is that span; PROBE_MAX_MINTS stops a very fast
+-- host from spinning. Startup therefore pays about PROBE_MIN_MS, or one derivation if a
+-- single one already exceeds it - bounded either way, and paid once per worker.
+local PROBE_MIN_MS = 5
+local PROBE_MAX_MINTS = 4096
+
+-- Checking the clock every mint would put a gettimeofday in the middle of the thing
+-- being timed, which at a low cost is the larger of the two. Checking every 32nd
+-- overshoots PROBE_MIN_MS by at most 31 mints and keeps the sample honest.
+local PROBE_CLOCK_EVERY = 32
+
+-- Filled in by M.New(). Bounded below at 1 so a host slow enough to blow the whole
+-- budget on a single derivation still serves one captcha per second rather than none.
+M.MintsPerSecond = 1
 
 -- We pay one pass of ALTCHA_COST per captcha page served, synchronously, on a worker
 -- that cannot yield partway through a derivation - so a mistyped cost is a self
@@ -392,10 +474,49 @@ function M.New(cost, algorithm, complexity)
     -- shipped lua-resty-openssl can reach the chosen algorithm at all, which is
     -- worth checking per algorithm rather than once: they take different paths
     -- through the binding.
-    local _, err = derive_key(string.rep("\0", NONCE_BYTES), string.rep("\0", SALT_BYTES), 0)
-    if err ~= nil then
-        return "altcha cannot derive keys, " .. err
+    -- The probe doubles as the budget calibration. Time whole derivations: the third
+    -- argument is the counter, not a round count, so each call is exactly the work one
+    -- mint does at the configured cost - and no scaling by M.Cost is needed or correct,
+    -- because derive_key() already reads it.
+    --
+    -- ngx.now() returns a cached timestamp; update_time() on BOTH sides, or the
+    -- difference measures how stale the cache was rather than how long the work took.
+    local nonce = string.rep("\0", NONCE_BYTES)
+    local salt = string.rep("\0", SALT_BYTES)
+    ngx.update_time()
+    local probe_started = ngx.now()
+    local minted, elapsed_ms = 0, 0
+    while true do
+        minted = minted + 1
+        local _, probe_err = derive_key(nonce, salt, minted)
+        if probe_err ~= nil then
+            return "altcha cannot derive keys, " .. probe_err
+        end
+        if minted % PROBE_CLOCK_EVERY == 0 or minted == 1 then
+            ngx.update_time()
+            elapsed_ms = (ngx.now() - probe_started) * 1000
+            if elapsed_ms >= PROBE_MIN_MS or minted >= PROBE_MAX_MINTS then
+                break
+            end
+        end
     end
+
+    -- A zero here means "too fast for the clock even across PROBE_MAX_MINTS mints"
+    -- rather than free, so charge the smallest span the clock can express. That leaves
+    -- the budget generous, which is the right direction for work this cheap, and keeps
+    -- the division below safe.
+    if elapsed_ms <= 0 then
+        elapsed_ms = 1.0
+    end
+    local per_mint_ms = elapsed_ms / minted
+    local workers = ngx.worker.count() or 1
+    local budget_ms = MINT_BUDGET_MS_PER_WORKER_SECOND * workers
+
+    M.MintsPerSecond = math.max(1, math.floor(budget_ms / per_mint_ms))
+    ngx.log(ngx.NOTICE, "altcha: a key derivation at ALTCHA_COST=", M.Cost, " costs about ",
+        string.format("%.3f", per_mint_ms), " ms here, so minting is capped at ",
+        M.MintsPerSecond, " challenges per second across ", workers,
+        " worker(s); above that, captcha decisions degrade to FALLBACK_REMEDIATION")
 
     return nil
 end
@@ -422,6 +543,34 @@ function M.Challenge(ip)
 
     -- Counted before the work rather than after, so a derivation that fails still
     -- costs the caller its place in the window.
+    -- Aggregate budget first, and before the derivation rather than after: the whole
+    -- point is not to pay for work we are about to refuse. Keyed on the wall-clock
+    -- second so the bucket needs no sweeping, with a 2s TTL so the previous second's
+    -- key expires on its own. Checked here rather than above the reuse fast path,
+    -- because handing back an outstanding challenge costs nothing and must never be
+    -- refused for want of budget.
+    local second = MINT_BUDGET_PREFIX .. tostring(ngx.time())
+    local minted_this_second, budget_err = s:incr(second, 1, 0, 2)
+    if minted_this_second == nil then
+        -- incr failing means the dict is unusable; that is the shared-dict-full case the
+        -- per-IP counter below reports too, so fall through and let it speak.
+        ngx.log(ngx.ERR, "altcha could not read the mint budget: " .. tostring(budget_err))
+    elseif minted_this_second > M.MintsPerSecond then
+        -- Third return value: "already reported this second, do not log me again."
+        -- Only the budget refusal sets it. Every other failure below returns two
+        -- values, so nil falls through as false and those stay logged every time -
+        -- they are rare, and suppressing a real fault to save a write would be a
+        -- worse bug than the one this solves.
+        local now = ngx.time()
+        local reported = (budget_reported_second == now)
+        budget_reported_second = now
+        return nil, "altcha mint budget exhausted: " ..
+            (minted_this_second - M.MintsPerSecond) .. " refused this second, cap is " ..
+            M.MintsPerSecond .. " per second across all workers; a captcha would cost " ..
+            "more blocking time than is budgeted, so these decisions fall back to " ..
+            "FALLBACK_REMEDIATION", reported
+    end
+
     local mints, err = s:incr(MINT_PREFIX .. ip, 1, 0, CHALLENGE_TTL)
     if mints == nil then
         return nil, "failed to count altcha challenges for " .. ip .. ": " .. tostring(err)

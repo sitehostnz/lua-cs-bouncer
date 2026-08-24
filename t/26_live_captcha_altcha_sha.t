@@ -1,4 +1,4 @@
-# Live mode, CAPTCHA_PROVIDER=altcha, ALTCHA_ALGORITHM=SHA-256, solved for real.
+# Live mode, CAPTCHA_PROVIDER=altcha, ALTCHA_ALGORITHM=SHA-512, solved for real.
 #
 # t/25 does this for PBKDF2/SHA-256. ALTCHA_ALGORITHM accepts six values, and they
 # split across two branches of derive_key(): three go to one PBKDF2 call, three to an
@@ -31,7 +31,7 @@ run_tests();
 
 __DATA__
 
-=== TEST 26: altcha SHA-256 challenge solved end to end
+=== TEST 26: altcha SHA-512 challenge solved end to end
 
 --- init
 
@@ -126,7 +126,7 @@ $post->header('Content-Type' => 'application/x-www-form-urlencoded');
 $post->content('altcha-response=' . $encoded);
 my $solved = $ua->request($post);
 
-fail("a correct SHA-256 solution was refused: HTTP " . $solved->code
+fail("a correct SHA-512 solution was refused: HTTP " . $solved->code
    . " (expected 302 to the original URI)") unless $solved->code == 302;
 fail("released to '" . ($solved->header('Location') // '') . "', expected /t")
     unless ($solved->header('Location') // '') =~ m{/t$};

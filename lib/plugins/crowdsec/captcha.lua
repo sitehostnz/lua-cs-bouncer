@@ -33,6 +33,10 @@ captcha_frontend_js["altcha"] = "https://cdn.jsdelivr.net/npm/altcha@3.2.1/dist/
 -- own origin, which is a poor property for a security control. sha256 of
 -- dist/main/altcha.js at 3.2.1. It is a pair with the URL above - bump one and the
 -- other has to move with it, or the widget silently fails to load.
+--
+-- A third thing moves with them and lives in the other module: ALGORITHMS in
+-- altcha.lua is the set this exact bundle registers a solver for. Bumping the
+-- version means checking all three, and only two of them are in this file.
 local captcha_frontend_js_integrity = {}
 captcha_frontend_js_integrity["altcha"] = "sha256-CzPTjutlEjfukCQYlXjqZEvarRpqKbsRfmvOmGXqSIg="
 
@@ -47,6 +51,10 @@ captcha_frontend_key["altcha"] = "altcha"
 -- Anything unique to this file will do; it never reaches the browser.
 local ALTCHA_CHALLENGE_PLACEHOLDER = "__CROWDSEC_ALTCHA_CHALLENGE__"
 
+-- Per-worker latch for the upgrade hint below. Module state, so it resets on reload,
+-- which is when an operator is most likely to want it again.
+local forwarded_proto_hint_logged = false
+
 M.SecretKey = ""
 M.SiteKey = ""
 M.Template = ""
@@ -57,6 +65,20 @@ M.ret_code = ngx.HTTP_OK
 M.WidgetPath = ""
 M.WidgetBody = ""
 
+-- Provider variance is expressed two ways in this file, on purpose. The tables
+-- above carry per-provider values; anything that is not a value - altcha is
+-- self-verifying, needs no key pair, mints a challenge per visitor and declares its
+-- widget differently - is an inline `M.CaptchaProvider == "altcha"` branch rather
+-- than a trait table or a provider module.
+--
+-- That is a fork decision, not an oversight. This repository tracks upstream, and
+-- additive branches conflict rarely where a provider-interface refactor would
+-- conflict on every upstream change to this file. The same reasoning applies to the
+-- positional parameter list below: several downstream bouncers call M.New() and
+-- M.apply() themselves, so the signature is append-only and the back-compat shim in
+-- M.apply() exists for callers still on the pre-altcha form.
+--
+-- Both are worth revisiting the day this stops tracking upstream, and not before.
 function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code, altcha_cost, altcha_algorithm, altcha_complexity, insecure_template_path, widget_file, widget_path)
 
     M.CaptchaProvider = captcha_provider
@@ -137,6 +159,24 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
             -- relative path here would simply never match
             ngx.log(ngx.ERR, "ALTCHA_WIDGET_PATH '" .. widget_path .. "' must start with '/', " ..
                 "serving the widget from the CDN instead")
+        elseif widget_path:find("[%%?#]") ~= nil then
+            -- The path is interpolated into the script tag below, and that string
+            -- goes through template.compile(), where this value lands in the
+            -- replacement position of a gsub. Lua reads '%' there as a capture
+            -- reference, so anything other than '%%' raises - out of init_by_lua,
+            -- which stops nginx starting for every vhost rather than degrading this
+            -- one provider. Every other unusable widget configuration in this block
+            -- logs and falls back, and this was the one path that did not.
+            --
+            -- Such a path is only reachable double-encoded, which is reason enough to
+            -- refuse it. ServeWidget() compares against ngx.var.uri, and nginx decodes
+            -- that, so '%25' arrives as '%' and a request for
+            -- '/x/altcha%2520test.js' does match a configured '/x/altcha%20test.js' -
+            -- measured. '?' and '#' behave the same way via '%3F' and '%23'. So the
+            -- path is matchable, just not by anything a visitor would type, and the
+            -- init-time raise is now prevented in template.compile() as well.
+            ngx.log(ngx.ERR, "ALTCHA_WIDGET_PATH '" .. widget_path ..
+                "' must not contain '%', '?' or '#', serving the widget from the CDN instead")
         else
             local body = utils.read_file_bytes(widget_file)
             if body == nil or body == "" then
@@ -206,15 +246,21 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
                 '" crossorigin="anonymous"></script>'
         end
         -- auto="onload", so solving starts as the page paints instead of waiting
-        -- for a click. The bouncer only holds the verify state for 60s from serving
-        -- the page, and the click was never a bot barrier - the proof of work is
+        -- for a click. The bouncer only holds the verify state for CAPTCHA_VERIFY_TTL
+        -- from serving the page, and the click was never a bot barrier - the proof of work is
         -- the gate, and t/25 pays it with no browser at all - so a click bought no
         -- security and spent the visitor's solve window on noticing a button.
         -- The challenge itself is per-visitor, so a placeholder stands in here and
         -- M.apply() splices the visitor's own in.
         template_data["captcha_widget"] =
             '<altcha-widget id="captcha" name="' .. M.GetCaptchaBackendKey() ..
-            '" challenge=\'' .. ALTCHA_CHALLENGE_PLACEHOLDER .. '\' auto="onload"></altcha-widget>' ..
+            '" challenge=\'' .. ALTCHA_CHALLENGE_PLACEHOLDER ..
+            -- hideFooter drops the widget's "Protected by ALTCHA" credit. It is not a
+            -- bare attribute: the element observes only auto, challenge, configuration,
+            -- display, language, name, theme, type and workers, and everything else
+            -- arrives as JSON through `configuration`, which the widget JSON.parses and
+            -- Object.assigns over its defaults - so naming one key leaves the rest alone.
+            '\' auto="onload" configuration=\'{"hideFooter":true}\'></altcha-widget>' ..
             -- wrapped in a function so captchaCallback resolves when the event fires
             -- rather than while this script is parsed: it is declared further down
             '<script>document.getElementById("captcha")' ..
@@ -228,6 +274,27 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
     end
 
     local view = template.compile(captcha_template, template_data)
+
+    -- template.compile() iterates the data, not the template, so a placeholder with
+    -- no matching key is never visited and survives into the response verbatim. A
+    -- new templates/ deployed against an older lib/ - a commit-pin rollback that
+    -- leaves the templates alone - then serves a page with the literal text
+    -- {{captcha_frontend_js_tag}} in it, no script tag, no widget, and nothing in
+    -- the log to say so.
+    --
+    -- Reported rather than refused: '{{ }}' is also the delimiter of several
+    -- client-side template languages, so a custom captcha page may legitimately
+    -- contain a pair we know nothing about, and failing init over one would break a
+    -- working deployment to catch a broken one. A named line in the error log is
+    -- what was actually missing.
+    local unresolved = view:match("{{[%w_]+}}")
+    if unresolved ~= nil then
+        ngx.log(ngx.ERR, "captcha template leaves " .. unresolved .. " unsubstituted in " ..
+            TemplateFilePath .. " and it is served to visitors as literal text. If this " ..
+            "is a placeholder this bouncer should populate, lib/ and templates/ are from " ..
+            "different versions; if it belongs to a client-side template, ignore this line")
+    end
+
     M.Template = view
 
     if M.CaptchaProvider == "altcha" then
@@ -236,6 +303,13 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
         -- inlines its CSS and runs to about 20 kB.
         local at = view:find(ALTCHA_CHALLENGE_PLACEHOLDER, 1, true)
         if at == nil then
+            -- Both error returns below leave the provider unusable, and
+            -- csmod.Allow() calls ServeWidget() ahead of every gate it has. Without
+            -- clearing the pair the bundle keeps being served, on every vhost, for a
+            -- provider the bouncer has already declared it cannot use - which is
+            -- most of the way to undiagnosable from the outside.
+            M.WidgetPath = ""
+            M.WidgetBody = ""
             return "captcha template renders no altcha widget, add {{captcha_widget}} to " .. TemplateFilePath
         end
         -- Splitting at the first hit leaves any later one verbatim in the tail, so a
@@ -246,6 +320,8 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
         -- element parses first. Nothing about that is diagnosable from the page, so
         -- refuse here instead.
         if view:find(ALTCHA_CHALLENGE_PLACEHOLDER, at + #ALTCHA_CHALLENGE_PLACEHOLDER, true) ~= nil then
+            M.WidgetPath = ""
+            M.WidgetBody = ""
             return "captcha template renders more than one altcha widget, leave a single {{captcha_widget}} in " .. TemplateFilePath
         end
         M.TemplateHead = view:sub(1, at - 1)
@@ -278,6 +354,11 @@ function M.ServeWidget()
     -- configuration names the file altcha-<version>.js): a new bundle then arrives
     -- under a new URL instead of as a revalidation of this one.
     ngx.header.cache_control = "public, max-age=31536000, immutable"
+    -- Known since init and fixed for the process lifetime, so setting it costs
+    -- nothing and saves the response being chunked on HTTP/1.1. Note the bundle
+    -- goes out as application/javascript, which is not in nginx's default
+    -- gzip_types - see the self-hosting section of the README.
+    ngx.header.content_length = #M.WidgetBody
     ngx.status = ngx.HTTP_OK
     -- print, not say: say appends a newline, and this is a byte-exact copy of a
     -- file whose checksum the operator may well be checking
@@ -285,28 +366,88 @@ function M.ServeWidget()
     ngx.exit(ngx.HTTP_OK)
 end
 
--- Whether the visitor's browser is plausibly in a secure context, as far as that
--- can be judged from here: TLS on this hop, TLS terminated upstream and declared
--- via X-Forwarded-Proto (e.g. Cloudflare Flexible), or a loopback / *.localhost
--- origin, which browsers treat as secure whatever the scheme. The forwarded header
--- and the Host are trusted unverified on purpose - this gate protects the visitor
--- from an unusable widget, not the remediation from the visitor: forging either
--- buys a bot nothing but the captcha page the gate would have spared it, and
--- Validate() never consults the scheme at all.
+-- Whether the visitor's browser is plausibly in a secure context, as far as that can
+-- be judged from here: TLS on this hop, an operator saying so for this vhost, or a
+-- loopback origin, which browsers treat as secure whatever the scheme.
+--
+-- X-Forwarded-Proto is deliberately not consulted. There is no way from here to tell
+-- "the trusted proxy set this" from "the client sent it and the proxy passed it
+-- through": nginx does not record who wrote a header, and realip only proves a trusted
+-- proxy is somewhere in the path, never that it vouched for this particular header.
+-- Those two come apart whenever a proxy sets X-Forwarded-For but not
+-- X-Forwarded-Proto, which is the common half-configured case, and t/27 used to assert
+-- a client-supplied header being honoured - the bypass, written down as the feature. A
+-- deployment terminating TLS upstream says so with $crowdsec_assume_secure instead,
+-- which is an assertion the operator makes rather than a guess we make from something
+-- the visitor can send.
+--
+-- Getting served the captcha page where the gate would have denied is not a harmless
+-- downgrade: altcha's challenge is deliberately solvable without a browser - t/25 pays
+-- one in about forty lines of Perl - so forging past this buys a scriptable release
+-- from a denial, not merely the page the gate would have spared you. That is why every
+-- branch below is either nginx's own knowledge or the operator's explicit word.
 local function browser_context_is_secure()
     if ngx.var.scheme == "https" then
         return true
     end
-    local forwarded_proto = ngx.var.http_x_forwarded_proto
-    if forwarded_proto ~= nil and forwarded_proto:lower() == "https" then
+
+    -- The operator's assertion for this vhost, in the shape the bouncer already uses
+    -- for its other switches: `set $crowdsec_assume_secure 1;` in a server block.
+    -- This is the only way to describe a proxy that terminates TLS and forwards over
+    -- plain HTTP, however it announces itself (X-Forwarded-Proto, X-Forwarded-Protocol,
+    -- X-Url-Scheme, Front-End-Https, or nothing at all). Without it every captcha
+    -- decision on such a vhost becomes a denial telling an HTTPS visitor to retry over
+    -- HTTPS, which the operator cannot tell from genuine plain HTTP in the log.
+    if ngx.var.crowdsec_assume_secure == "1" then
         return true
     end
-    -- the browser's own rule, not a heuristic: localhost, *.localhost and the
-    -- loopback literals are secure contexts, which is what keeps local development
-    -- over plain http on the captcha page rather than the denial below
+
+    -- The browser's own rule, not a heuristic: localhost, *.localhost and the loopback
+    -- literals are secure contexts, which is what keeps local development over plain
+    -- http on the captcha page rather than the denial below.
+    --
+    -- Paired with the TCP peer, because the Host alone is the client's to choose: a
+    -- remote scanner sending "Host: localhost" would otherwise be handed a challenge it
+    -- can solve without a browser.
+    --
+    -- KNOWN GAP, deliberately not closed here. The peer is the *proxy* whenever realip
+    -- is active, so behind a proxy on loopback - a same-host nginx, HAProxy or Varnish,
+    -- or a sidecar sharing the network namespace - it is 127.0.0.1 for every request
+    -- whatever the client's address, and a remote client sending "Host: localhost" to a
+    -- plaintext vhost still passes. The address the bouncer actually decides about is
+    -- ngx.var.remote_addr (what csmod.Allow() is handed), and comparing that instead is
+    -- the fix - but it flips every captcha suite, which reaches this branch via a
+    -- loopback Host with a forwarded remote address, so each needs
+    -- `set $crowdsec_assume_secure 1;` first. Tracked rather than half-done.
+    --
+    -- A container whose browser is on the host arrives from the bridge gateway rather
+    -- than loopback, so that case wants $crowdsec_assume_secure too.
     local host = ngx.var.host
-    return host == "localhost" or utils.ends_with(host, ".localhost")
+    if host == nil then
+        return false
+    end
+    local host_is_loopback = host == "localhost" or utils.ends_with(host, ".localhost")
         or host == "127.0.0.1" or host == "::1" or host == "[::1]"
+    if not host_is_loopback then
+        return false
+    end
+    local peer = ngx.var.realip_remote_addr or ngx.var.remote_addr
+    return peer ~= nil and (peer == "::1" or peer == "::ffff:127.0.0.1"
+        or utils.starts_with(peer, "127."))
+end
+
+--- Whether a captcha can usefully be served for this request at all.
+--
+-- Exported so csmod.Allow() can ask before it commits state. M.apply() checks the same
+-- predicate, and has to, because it is also the thing that renders the page - but by
+-- the time it answers, the caller has already written a VERIFY_STATE entry into
+-- crowdsec_cache for a captcha that is about to be refused. Those are attacker-paced
+-- writes into the same shared dict that holds the decision cache, which is the exact
+-- amplification altcha.New() refuses to allow for challenges.
+--
+-- One predicate, two callers: this returns the same answer M.apply() will act on.
+function M.CanServe()
+    return browser_context_is_secure()
 end
 
 -- ret_code is the status the appsec component asked for, or nil when the decision
@@ -335,6 +476,30 @@ function M.apply(remote_ip, ret_code)
     -- four. Checked before the challenge is minted so the visitor's mint budget is
     -- not charged for a page they would never have been able to use.
     if not browser_context_is_secure() then
+        -- The upgrade hint, emitted once per worker and above nginx's default
+        -- error_log level, because the two per-request lines below are not.
+        --
+        -- This deployment sent X-Forwarded-Proto: https and is being denied anyway,
+        -- which is the shape of "TLS is terminated upstream and nobody has set
+        -- $crowdsec_assume_secure yet". The per-request lines cannot say that: from
+        -- here a genuinely plain-HTTP request and a misconfigured proxied one are
+        -- identical, which is exactly the ambiguity the README calls out.
+        --
+        -- Reading the header for a diagnostic gives up nothing the gate refuses to
+        -- give up. A client that forges it buys one log line per worker, not a
+        -- challenge - the decision above has already been taken without it.
+        if not forwarded_proto_hint_logged then
+            local claimed = ngx.var.http_x_forwarded_proto
+            if claimed ~= nil and claimed:lower():find("https", 1, true) ~= nil then
+                forwarded_proto_hint_logged = true
+                ngx.log(ngx.ERR, "captcha refused for '" .. tostring(ngx.var.host) ..
+                    "': this request claims X-Forwarded-Proto: https, which this bouncer " ..
+                    "does not trust because nginx cannot tell a proxy's header from one a " ..
+                    "client sent. If TLS is terminated upstream, add " ..
+                    "`set $crowdsec_assume_secure 1;` to that server block, or every " ..
+                    "captcha decision here stays a denial. Logged once per worker")
+            end
+        end
         if M.InsecureTemplate ~= "" then
             -- INFO, not ERR: on a site serving plain HTTP this is the routine
             -- outcome for every bounced request, and a bot hammering one endpoint
@@ -365,13 +530,20 @@ function M.apply(remote_ip, ret_code)
     if M.CaptchaProvider == "altcha" then
         -- one challenge per visitor, so it cannot be baked into the template at
         -- init the way the other providers' widgets are
-        local err
-        challenge, err = altcha.Challenge(remote_ip)
+        local err, reported
+        challenge, err, reported = altcha.Challenge(remote_ip)
         if challenge == nil then
             -- Says which page actually went out: csmod.Allow() has already logged
             -- "denied with 'captcha'" by this point, and without this the ban that
             -- replaces it is invisible in the log.
-            ngx.log(ngx.ERR, "failed to issue an altcha challenge, serving a ban instead: " .. tostring(err))
+            --
+            -- Except when the failure is the mint budget shedding load, which happens
+            -- once per flooded request. Challenge() reports it once per worker per
+            -- second with a count; repeats inside that second set `reported` and are
+            -- passed over here. Any other failure leaves it nil and is logged.
+            if not reported then
+                ngx.log(ngx.ERR, "failed to issue an altcha challenge, serving a ban instead: " .. tostring(err))
+            end
             -- a page with no challenge is a dead end for the visitor, so drop them
             -- the way a ban would - through ban.apply rather than a bare 403, so
             -- RET_CODE, REDIRECT_LOCATION and BAN_TEMPLATE_PATH are honoured

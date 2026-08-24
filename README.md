@@ -31,20 +31,45 @@ rather than a blank form.
 > page is not configured. Solving the captcha over HTTPS releases the address for
 > plain HTTP too.
 >
-> Two things still count as secure. Terminating TLS at an upstream proxy is fine —
-> what matters is the scheme the browser sees, not the one nginx sees, and
-> `X-Forwarded-Proto: https` is how the proxy says so. And `http://localhost`,
-> `*.localhost`, `http://127.0.0.1` and `http://[::1]` are themselves secure
-> contexts, so local development over plain HTTP is served the captcha as normal.
+> Two things still count as secure.
+>
+> **`set $crowdsec_assume_secure 1;`** in a `server` block. This is how a deployment
+> that terminates TLS upstream says so, and it is the **only** way — `X-Forwarded-Proto`
+> is deliberately not consulted. nginx records that a trusted proxy is in the request
+> path; it does not record who wrote any particular header, so a proxy that sets
+> `X-Forwarded-For` but not `X-Forwarded-Proto` (two separate `proxy_set_header` lines,
+> so a common half-configuration) passes the visitor's own value straight through, and
+> nothing available inside nginx can tell that from the proxy's own assertion. An
+> operator assertion is trustworthy where a forwarded header is not. Without
+> this, every captcha decision on such a vhost becomes a denial telling an HTTPS
+> visitor to retry over HTTPS — and nothing in the log distinguishes that from a
+> genuinely plain-HTTP request, because from the bouncer's side the two are
+> identical. **If your captcha decisions turn into 403s the moment you enable a
+> provider, this is the first thing to check.**
+>
+> **A loopback origin.** `http://localhost`, `*.localhost`, `http://127.0.0.1` and
+> `http://[::1]` are themselves secure contexts, so local development over plain
+> HTTP is served the captcha as normal — provided the request also arrives from a
+> loopback address, since the `Host` header alone is the client's to choose. If nginx
+> runs in a container and the browser is on the host, the request arrives from the
+> bridge gateway instead: use `$crowdsec_assume_secure` in that vhost.
 
 It also needs two things the other providers do not, both outside `crowdsec.conf`:
 
 1. **Two extra rocks**, which is where the key derivation comes from:
 
    ```
-   luarocks install lua-resty-string
-   luarocks install lua-resty-openssl
+   luarocks install lua-resty-string 0.09-0
+   luarocks install lua-resty-openssl 1.8.0-1
    ```
+
+   Those are the versions CI exercises, and the only ones this code is tested
+   against. Pin them. `lua-resty-openssl` is an FFI binding whose API tracks the
+   OpenSSL it was built for, and `altcha.lua` reaches into `resty.openssl.kdf` and
+   `resty.openssl.digest` directly — a release that reshapes either turns every
+   captcha decision into `FALLBACK_REMEDIATION` with one line in the startup log, and
+   one that removes a function stops nginx starting outright. This repository is
+   consumed by commit pin, so its Lua is frozen while unpinned rocks are not.
 
    Both are pure-Lua FFI bindings and need no build dependencies. They are loaded
    only when `CAPTCHA_PROVIDER=altcha`; if they are missing, altcha refuses to
@@ -112,6 +137,11 @@ is ignored with a line in the log and the CDN copy is used instead.
 Verify the bundle where you fetch it (a checksum in your image build, say) rather
 than in the browser, and put the version in the path so a new bundle arrives under a
 new URL.
+
+The bundle goes out as `application/javascript`, which is **not** in nginx's default
+`gzip_types` — that default is `text/html` alone. Add it there if you want the
+response compressed; the bouncer sets `Content-Length` and leaves the encoding to
+nginx rather than holding a second, compressed copy.
 
 The bundle is served from the access phase, before any remediation runs. That is
 what makes it work on **every vhost with no location block**, and it is also
