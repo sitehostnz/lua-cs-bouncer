@@ -25,6 +25,14 @@ local csmod = {}
 
 local DENY = "deny"
 
+-- How long a served captcha page stays redeemable: the window between handing a
+-- visitor the page and accepting their solution. Was a bare 60 mid-function, which
+-- self-solving widgets rarely noticed but slow hardware did - the altcha work now
+-- starts as the page paints, and this is the whole budget it has to finish inside,
+-- so it is sized for a modest phone rather than a fast laptop. Kept well under
+-- altcha's 1200s challenge TTL so a re-served page still carries a live challenge.
+local CAPTCHA_VERIFY_TTL = 300
+
 local APPSEC_API_KEY_HEADER = "x-crowdsec-appsec-api-key"
 local APPSEC_IP_HEADER = "x-crowdsec-appsec-ip"
 local APPSEC_HOST_HEADER = "x-crowdsec-appsec-host"
@@ -122,20 +130,50 @@ function csmod.init(configFile, userAgent)
     ngx.log(ngx.ERR, "redirect location is set to '/' this will lead into infinite redirection")
   end
 
-  local captcha_ok = true
-  local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"])
-  if err ~= nil then
-    ngx.log(ngx.ERR, "error loading captcha plugin: " .. err)
-    captcha_ok = false
-  end
-  local succ, err, forcible = runtime.cache:set("captcha_ok", captcha_ok)
-  if not succ then
-    ngx.log(ngx.ERR, "failed to add captcha state key in cache: "..err)
-  end
-  if forcible then
-    ngx.log(ngx.ERR, "Lua shared dict (crowdsec cache) is full, please increase dict size in config")
+  -- Whether the captcha plugin configured successfully. Module state rather than a
+  -- crowdsec_cache entry: it is derived once from configuration, identical in every
+  -- worker (init_by_lua runs before workers fork) and never mutated after init, so
+  -- sharing bought nothing - and a dict entry can be evicted, which converted every
+  -- captcha decision into FALLBACK_REMEDIATION for the dict's remaining lifetime
+  -- the moment memory pressure pushed the flag out.
+  --
+  -- An empty CAPTCHA_PROVIDER= line is how a configuration says "no captcha here" -
+  -- the stock CrowdSec config ships exactly that shape - so it is stated once at
+  -- startup rather than reported as the error an unsupported value is.
+  runtime.captcha_ok = true
+  if (runtime.conf["CAPTCHA_PROVIDER"] or "") == "" then
+    runtime.captcha_ok = false
+    ngx.log(ngx.NOTICE, "CAPTCHA_PROVIDER is not set, captcha decisions will be served the fallback remediation")
+  else
+    local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"], runtime.conf["CAPTCHA_INSECURE_TEMPLATE_PATH"], runtime.conf["ALTCHA_WIDGET_FILE"], runtime.conf["ALTCHA_WIDGET_PATH"])
+    if err ~= nil then
+      ngx.log(ngx.ERR, "error loading captcha plugin: " .. err)
+      runtime.captcha_ok = false
+    end
   end
 
+
+  -- FALLBACK_REMEDIATION=captcha is a valid, documented value, and with no captcha
+  -- to serve it makes the fallback chain in Allow() rewrite captcha to captcha: the
+  -- ban arm does not match, the challenge arm does not match, the captcha arm is
+  -- gated on captcha_ok, and the request falls through to DECLINED - allowed, with
+  -- no log line, for as long as the provider stays broken. OVERRIDE_REMEDIATION
+  -- widens that from captcha decisions to every decision the LAPI returns.
+  --
+  -- Settled here rather than per request, because everything needed to settle it is
+  -- already known: the documented promise is that an unusable captcha "degrades to
+  -- FALLBACK_REMEDIATION", and degrading to something unservable is not degrading.
+  if runtime.fallback == "captcha" and not runtime.captcha_ok then
+    ngx.log(ngx.ERR, "FALLBACK_REMEDIATION is 'captcha' but no captcha can be served, " ..
+      "falling back to 'ban' instead - a captcha fallback for a broken captcha provider " ..
+      "would allow every bounced request through")
+    runtime.fallback = "ban"
+    -- Both, so the two cannot disagree. csmod.AppSecCheck() is public and reads the
+    -- config value rather than runtime.fallback; it happens to come out right today
+    -- because its remediation flows back through the chain in Allow(), but "settled
+    -- at init" has to mean settled for every reader, not just the one downstream.
+    runtime.conf["FALLBACK_REMEDIATION"] = "ban"
+  end
 
   local err = ban.new(runtime.conf["BAN_TEMPLATE_PATH"], runtime.conf["REDIRECT_LOCATION"], runtime.conf["RET_CODE"])
   if err ~= nil then
@@ -691,11 +729,57 @@ function csmod.AppSecCheck(ip)
 
 end
 
+--- Reduces a stored release URI to something safe to put in a Location header.
+--
+-- A single-slash absolute path with no control characters, or "/" if it is anything
+-- else. "//host/x" and "/\\host/x" are both read as an authority by a browser's URL
+-- parser, and every byte ngx.redirect() refuses is a control character (measured: it
+-- rejects 0-8, 10-31 and 127, all of which %c matches), so this one test covers both
+-- the off-origin redirect and the 500.
+--
+-- Applied on read as well as on write, deliberately. The write site keeps hostile
+-- values out of entries this build creates; the read site is what covers entries it
+-- did not. lua_shared_dict zones are inherited across `nginx -s reload` when the name
+-- and size are unchanged, so an in-place Lua upgrade leaves VERIFY_STATE entries
+-- written by the previous build readable for the rest of CAPTCHA_VERIFY_TTL - and
+-- before this guard existed those held the raw Referer. Checking on read also means a
+-- future writer cannot reintroduce the hole by forgetting the write-site call.
+--
+-- Length is capped for a different reason: the entry lands in crowdsec_cache, the same
+-- zone holding the decisions this bouncer exists to enforce, and its size is chosen by
+-- whoever sent the request. Measured cost per bounced address, by path length: 256 B at
+-- 9 bytes, 2,181 B at 1 kB, 8,325 B at 8 kB - so a long path buys 32x the dict per
+-- address, and at the mint budget's ~800/s that is 6.6 MB/s into a zone a deployment
+-- typically sizes at 50 MB. Full in seconds, then evicting decisions for as long as the
+-- flood lasts. Rejecting rather than truncating: a truncated path is a different valid
+-- page, which is a wrong destination rather than a lost one. 512 bytes is past any real
+-- URL, and the cost of being over it is the return destination, never access.
+local MAX_RELEASE_URI = 512
+
+local function safe_release_uri(uri)
+  if type(uri) ~= "string" then
+    return "/"
+  end
+  if #uri > MAX_RELEASE_URI then
+    return "/"
+  end
+  if uri ~= "/" and (uri:find("^/[^/\\]") == nil or uri:find("%c") ~= nil) then
+    return "/"
+  end
+  return uri
+end
+
 --- return if the IP is allowed or not
 -- return if the IP is allowed, false otherwise
 -- the function is called from nginx access_by_lua_block
 -- @param ip the IP to check
 function csmod.Allow(ip)
+  -- Before anything else, including the enabled checks and the location
+  -- exclusions: this serves the bouncer's own self-hosted captcha widget, and a
+  -- request for it must never be bounced (see captcha.ServeWidget). It is a no-op
+  -- unless ALTCHA_WIDGET_FILE and ALTCHA_WIDGET_PATH are both configured.
+  captcha.ServeWidget() -- serves the bundle and exits when the URI matches
+
   local remediationSource = flag.BOUNCER_SOURCE
   local ret_code = nil
   local remediation = ""
@@ -757,11 +841,37 @@ function csmod.Allow(ip)
     end
   end
 
-  local captcha_ok = runtime.cache:get("captcha_ok")
+  local captcha_ok = runtime.captcha_ok
+
+  -- serve one remediation for every bounced decision, whatever type the LAPI or the
+  -- appsec component returned. Applied before the fallback below, so forcing captcha
+  -- while the captcha provider is misconfigured still degrades to FALLBACK_REMEDIATION.
+  -- `or ""` so an absent key reads as "not set" rather than as "set to nil", which
+  -- would assign nil to remediation and match no arm below. Not reachable while the
+  -- main config is always loaded with defaults, but the guard below it needed a
+  -- default added for exactly this shape, and the two should agree.
+  if not ok and (runtime.conf["OVERRIDE_REMEDIATION"] or "") ~= "" then
+    -- an appsec challenge arrives with a response body, headers and cookies the
+    -- challenge arm would forward; overriding it throws those away, which is
+    -- documented behaviour but should never be silent behaviour
+    if remediation == "challenge" and appsec_response ~= nil then
+      -- INFO, not ERR: with both settings configured this is the routine outcome
+      -- for every bounced request that appsec challenged, so at ERR its volume
+      -- tracks attack traffic and buries the genuine errors either side of it. The
+      -- same reasoning is written down at captcha.lua's insecure-context branch.
+      ngx.log(ngx.INFO, "[Crowdsec] OVERRIDE_REMEDIATION discards the appsec challenge response for '" .. ip .. "'")
+    end
+    remediation = runtime.conf["OVERRIDE_REMEDIATION"]
+  end
 
   if runtime.fallback ~= "" then
     -- if we can't use captcha, fallback
-    if remediation == "captcha" and captcha_ok == false then
+    -- `not captcha_ok` rather than `== false`: nil (init never completed) and false
+    -- (provider unset or misconfigured) both mean there is no captcha to serve, and
+    -- either shape slipping past here would skip the captcha arm below too and let
+    -- the request fall through to DECLINED. OVERRIDE_REMEDIATION=captcha rewrites
+    -- every decision to captcha, so that fail-open would reach bans as well.
+    if remediation == "captcha" and not captcha_ok then
       remediation = runtime.fallback
     end
 
@@ -771,7 +881,12 @@ function csmod.Allow(ip)
     end
   end
 
-  if captcha_ok then
+  -- captcha.CanServe() as well as captcha_ok: the first is "the provider configured",
+  -- the second is "this request could actually use it". Without the second, a vhost that
+  -- is not a secure context reads the body and runs validateCaptcha() on every request
+  -- from a bounced address, to conclude there is nothing to validate - and logs
+  -- "Invalid captcha from <ip>" at ALERT for a visitor who was never offered one.
+  if captcha_ok and captcha.CanServe() then
     -- if captcha can be used (configuration is valid)
     -- we check if the IP needs to validate its captcha before checking it against CrowdSec local API
     local previous_uri, flags = ngx.shared.crowdsec_cache:get("captcha_" .. ip)
@@ -811,7 +926,7 @@ function csmod.Allow(ip)
             else
               local succ, err, forcible = ngx.shared.crowdsec_cache:set(
                 "captcha_" .. ip,
-                previous_uri,
+                safe_release_uri(previous_uri),
                 runtime.conf["CAPTCHA_EXPIRATION"],
                 bit.bor(flag.VALIDATED_STATE, source)
               )
@@ -825,9 +940,40 @@ function csmod.Allow(ip)
               end
             end
 
+            -- Counterpart to the "Invalid captcha from" line below: without it a
+            -- solve is silent, so the logs show every failed attempt and nothing
+            -- that got through. How long the IP stays released explains the quiet
+            -- that follows, so it goes in the line too.
+            --
+            -- Resolve the destination once, so the log names where the visitor is
+            -- actually going. safe_release_uri() can substitute "/" - for a
+            -- pre-existing entry written before the guard existed, say - and a log line
+            -- naming the rejected value while the Location says something else is the
+            -- wrong thing to be reading during an incident.
+            --
+            -- Still scrubbed and truncated on top: the value can only reach here from a
+            -- cache entry, but a pre-guard entry can carry control characters and
+            -- arbitrary length, and safe_release_uri() replaces those wholesale rather
+            -- than cleaning them.
+            local release_uri = safe_release_uri(previous_uri)
+            local logged_uri = (tostring(release_uri):gsub("%c", "?"))
+            if #logged_uri > 200 then
+              logged_uri = logged_uri:sub(1, 200) .. "..."
+            end
+            -- The appsec branch above deleted the state instead of storing it, so
+            -- there is no CAPTCHA_EXPIRATION window to report there - that IP is
+            -- challenged again as soon as appsec next triggers.
+            local released_for = " until appsec triggers again"
+            if source ~= flag.APPSEC_SOURCE then
+              released_for = " for " .. runtime.conf["CAPTCHA_EXPIRATION"] .. "s"
+            end
+            ngx.log(ngx.ALERT, "[Crowdsec] '" .. ip .. "' solved the " ..
+              runtime.conf["CAPTCHA_PROVIDER"] .. " captcha, releasing to '" ..
+              logged_uri .. "'" .. released_for)
+
             -- captcha is valid, we redirect the IP to its previous URI using the GET method
             ngx.req.set_method(ngx.HTTP_GET)
-            return ngx.redirect(previous_uri)
+            return ngx.redirect(release_uri)
           else
             ngx.log(ngx.ALERT, "Invalid captcha from " .. ip)
           end
@@ -859,16 +1005,60 @@ function csmod.Allow(ip)
           -- we check if the IP is already in cache for captcha and not yet validated
           if previous_uri == nil or state_id ~= flag.VALIDATED_STATE or remediationSource == flag.APPSEC_SOURCE then 
               local uri = ngx.var.uri
-              -- in case its not a GET request, we prefer to fallback on referer
               if ngx.req.get_method() ~= "GET" then
-                local headers, err = ngx.req.get_headers()
-                for k, v in pairs(headers) do
-                  if k == "referer" then
-                    uri = v
-                  end
-                end
+                -- A non-GET has no page of its own to return to: ngx.var.uri is the
+                -- endpoint the form posted to, and a GET to that after the solve is
+                -- often a 405. Keep whatever the GET that opened this flow recorded,
+                -- so a failed solve does not cost the visitor their destination - the
+                -- captcha form posts to itself, so a wrong answer lands here and would
+                -- otherwise overwrite the entry.
+                --
+                -- On an appsec re-challenge the entry may already be VALIDATED from
+                -- an earlier, finished flow, so the value carried forward can predate
+                -- the request being served. It is always a path this same visitor
+                -- asked for, so that is a stale destination rather than a wrong one.
+                --
+                -- Upstream read the Referer here instead. That is client-chosen and
+                -- this value goes straight into a Location header on the next solve,
+                -- which made it an open redirect; it is also suppressed outright by
+                -- Referrer-Policy: no-referrer, so it was never reliable. Reading the
+                -- stored value instead means everything in this entry originated from
+                -- ngx.var.uri or the literal "/" - no client input, so nothing to
+                -- validate and no parser to get wrong.
+                uri = previous_uri or "/"
               end
-              local succ, err, forcible = ngx.shared.crowdsec_cache:set("captcha_"..ip, uri , 60, bit.bor(flag.VERIFY_STATE, remediationSource))
+
+              -- $uri is nginx-normalised but percent-DECODED, so it is still the
+              -- client's bytes and the only thing that made it look safe was where it
+              -- came from. "/%5cevil.example/x" decodes to "/\\evil.example/x", and a
+              -- browser's URL parser treats a backslash as a solidus for special
+              -- schemes, so that Location is read as "//evil.example/x" - off-origin,
+              -- which is the redirect this whole path was cleaned up to prevent.
+              -- "%0d%0a" decodes to bytes ngx.redirect() refuses outright, turning the
+              -- response that releases the visitor into a 500. nginx collapses a real
+              -- "//" itself, so the backslash is the shape that gets this far.
+              --
+              -- Guarded here rather than at the redirect because this is the only
+              -- writer of the entry: the VALIDATED_STATE write on a successful solve
+              -- carries this value forward, so cleaning it once keeps the cache itself
+              -- free of anything hostile and every reader inherits that.
+              local safe_uri = safe_release_uri(uri)
+              if safe_uri ~= uri then
+                ngx.log(ngx.NOTICE, "[Crowdsec] unusable release URI for '" .. ip ..
+                  "', releasing to '/' instead")
+              end
+              uri = safe_uri
+
+              -- Only once we know a captcha is actually going out. captcha.apply()
+              -- below decides that too, and if it decides no, this entry would be a
+              -- 300s attacker-paced write into the decision cache's own dict for a page
+              -- the visitor never saw - repeated on every request from that address.
+              -- apply() already protects the mint budget from this; the dict write and
+              -- the body read on the next request are the more expensive halves.
+              local succ, err, forcible = true, nil, false
+              if captcha.CanServe() then
+                succ, err, forcible = ngx.shared.crowdsec_cache:set("captcha_"..ip, uri , CAPTCHA_VERIFY_TTL, bit.bor(flag.VERIFY_STATE, remediationSource))
+              end
               if not succ then
                 ngx.log(ngx.ERR, "failed to add key about captcha for ip '" .. ip .. "' in cache: "..err)
               end
@@ -876,7 +1066,10 @@ function csmod.Allow(ip)
                 ngx.log(ngx.ERR, "Lua shared dict (crowdsec cache) is full, please increase dict size in config")
               end
               ngx.log(ngx.ALERT, "[Crowdsec] denied '" .. ip .. "' with '"..remediation.."'")
-              captcha.apply()
+              -- ret_code goes with it so that if the captcha cannot be served and
+              -- this degrades to a ban, it carries the same status the ban arms
+              -- above would have used.
+              captcha.apply(ip, ret_code)
               return
           end
       end

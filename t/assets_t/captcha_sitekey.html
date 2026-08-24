@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><title>CrowdSec Captcha</title></head>
+<body>
+<!-- Minimal template whose only purpose is to put an operator-supplied config value
+     through template.compile()'s replacement position. SITE_KEY is unused by altcha,
+     but it is still substituted, and a '%' in it raises "invalid capture index" out of
+     init_by_lua unless template.compile() escapes the replacement. The altcha widget
+     placeholder is required by captcha.New(), so it has to be here too. -->
+<p id="sitekey">{{captcha_site_key}}</p>
+<form action="" method="POST">{{captcha_widget}}</form>
+<script>function captchaCallback () { document.querySelector('form').submit(); }</script>
+</body>
+</html>

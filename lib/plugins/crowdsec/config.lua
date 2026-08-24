@@ -1,7 +1,7 @@
 local config = {}
 
-local valid_params = {'ENABLED', 'ENABLE_INTERNAL', 'API_URL', 'API_KEY', 'BOUNCING_ON_TYPE', 'MODE', 'SECRET_KEY', 'SITE_KEY', 'BAN_TEMPLATE_PATH' ,'CAPTCHA_TEMPLATE_PATH', 'REDIRECT_LOCATION', 'RET_CODE', 'CAPTCHA_RET_CODE', 'EXCLUDE_LOCATION', 'FALLBACK_REMEDIATION', 'CAPTCHA_PROVIDER', 'APPSEC_URL', 'APPSEC_FAILURE_ACTION', 'ALWAYS_SEND_TO_APPSEC', 'APPSEC_DROP_UNREADABLE_BODY', 'SSL_VERIFY', 'USE_TLS_AUTH', 'TLS_CLIENT_CERT', 'TLS_CLIENT_KEY', 'SCENARIOS_CONTAINING', 'SCENARIOS_NOT_CONTAINING'}
-local valid_int_params = {'CACHE_EXPIRATION', 'CACHE_SIZE', 'REQUEST_TIMEOUT', 'UPDATE_FREQUENCY', 'CAPTCHA_EXPIRATION', 'APPSEC_CONNECT_TIMEOUT', 'APPSEC_SEND_TIMEOUT', 'APPSEC_PROCESS_TIMEOUT', 'STREAM_REQUEST_TIMEOUT'}
+local valid_params = {'ENABLED', 'ENABLE_INTERNAL', 'API_URL', 'API_KEY', 'BOUNCING_ON_TYPE', 'MODE', 'SECRET_KEY', 'SITE_KEY', 'BAN_TEMPLATE_PATH' ,'CAPTCHA_TEMPLATE_PATH', 'CAPTCHA_INSECURE_TEMPLATE_PATH', 'ALTCHA_WIDGET_FILE', 'ALTCHA_WIDGET_PATH', 'REDIRECT_LOCATION', 'RET_CODE', 'CAPTCHA_RET_CODE', 'EXCLUDE_LOCATION', 'FALLBACK_REMEDIATION', 'OVERRIDE_REMEDIATION', 'CAPTCHA_PROVIDER', 'ALTCHA_ALGORITHM', 'APPSEC_URL', 'APPSEC_FAILURE_ACTION', 'ALWAYS_SEND_TO_APPSEC', 'APPSEC_DROP_UNREADABLE_BODY', 'SSL_VERIFY', 'USE_TLS_AUTH', 'TLS_CLIENT_CERT', 'TLS_CLIENT_KEY', 'SCENARIOS_CONTAINING', 'SCENARIOS_NOT_CONTAINING'}
+local valid_int_params = {'CACHE_EXPIRATION', 'CACHE_SIZE', 'REQUEST_TIMEOUT', 'UPDATE_FREQUENCY', 'CAPTCHA_EXPIRATION', 'ALTCHA_COST', 'ALTCHA_COMPLEXITY', 'APPSEC_CONNECT_TIMEOUT', 'APPSEC_SEND_TIMEOUT', 'APPSEC_PROCESS_TIMEOUT', 'STREAM_REQUEST_TIMEOUT'}
 -- CACHE_SIZE is not used in the code, but as is was valid parameter for the configuration file, not removing it now
 local valid_bouncing_on_type_values = {'ban', 'captcha', 'all'}
 local valid_truefalse_values = {'false', 'true'}
@@ -18,7 +18,20 @@ local default_values = {
     ['REDIRECT_LOCATION'] = "",
     ['EXCLUDE_LOCATION'] = {},
     ['RET_CODE'] = 0,
+    -- Without a default, omitting the line leaves runtime.fallback nil, and the two
+    -- fallback branches in csmod.Allow() then set remediation to nil rather than to
+    -- a remediation - which matches no arm and lets the request through. 'ban' is
+    -- what loadConfig() already coerces an invalid value to, and is the fail-closed
+    -- choice.
+    ['FALLBACK_REMEDIATION'] = "ban",
+    ['OVERRIDE_REMEDIATION'] = "",
     ['CAPTCHA_PROVIDER'] = "recaptcha",
+    -- No ALTCHA_COST default on purpose. A default set here arrives at altcha.New()
+    -- indistinguishable from a value the operator typed, and the sensible default
+    -- differs by an order of magnitude between the PBKDF2 and SHA families. altcha.lua
+    -- picks it once it knows the algorithm.
+    ['ALTCHA_COMPLEXITY'] = 10000,
+    ['ALTCHA_ALGORITHM'] = "PBKDF2/SHA-256",
     ['APPSEC_URL'] = "",
     ['APPSEC_CONNECT_TIMEOUT'] = 100,
     ['APPSEC_SEND_TIMEOUT'] = 100,
@@ -130,6 +143,12 @@ function config.loadConfig(file, default)
                 ngx.log(ngx.ERR, "unsupported value '" .. value .. "' for variable '" .. key .. "'. Using default value 'ban' instead")
                 value = "ban"
                 end
+            elseif key == "OVERRIDE_REMEDIATION" then
+                -- empty means the remediation returned by the LAPI is used as-is
+                if value ~= "" and not has_value({'captcha', 'ban'}, value) then
+                ngx.log(ngx.ERR, "unsupported value '" .. value .. "' for variable '" .. key .. "'. Using default value '' instead")
+                value = ""
+                end
             end
             conf[key] = value
 
@@ -145,7 +164,21 @@ function config.loadConfig(file, default)
 
 
         elseif has_value(valid_int_params, key) then
-            conf[key] = tonumber(value)
+            local number = tonumber(value)
+            -- Left nil so the default below fills it in, which is what already
+            -- happened - but silently. Say so instead: every string parameter above
+            -- logs an unsupported value, and these are the knobs the altcha
+            -- documentation tells operators to tune, so a typo reverting to the
+            -- default without a trace is the worst outcome.
+            if number == nil then
+                -- Names the file and says "ignoring it" rather than "using the
+                -- default": this function is also called for crowdsec.conf.local with
+                -- default=false, where the key is simply dropped and the value that
+                -- survives is the main config's, not the default. "Ignoring it" is
+                -- true of both call sites; "using the default" is only true of one.
+                ngx.log(ngx.ERR, "unsupported value '" .. value .. "' for variable '" .. key .. "' in " .. file .. ", ignoring it")
+            end
+            conf[key] = number
         else
             ngx.log(ngx.ERR, "unsupported configuration '" .. key .. "'")
         end
