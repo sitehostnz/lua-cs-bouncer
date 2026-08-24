@@ -8,13 +8,19 @@
 #   plain HTTP, page configured    -> CAPTCHA_INSECURE_TEMPLATE_PATH, with a ban's
 #                                     status, and without minting a challenge
 #   plain HTTP, page not set       -> the ban remediation
-#   X-Forwarded-Proto: https       -> the captcha (TLS terminated upstream)
+#   $crowdsec_assume_secure 1      -> the captcha (TLS terminated upstream, declared
+#                                     by the operator rather than guessed at)
 #   loopback / localhost origin    -> the captcha (a secure context whatever the
 #                                     scheme, which is what keeps local development
 #                                     and this suite's own 127.0.0.1 requests working)
+#   X-Forwarded-Proto: https       -> NOT honoured, deliberately. Nothing can tell a
+#                                     header the trusted proxy set from one the client
+#                                     sent and the proxy passed through, so the gate
+#                                     does not consult it at all. The last case below
+#                                     is the regression test for that.
 #
 # Every request this suite makes is plain HTTP, so "secure" is asserted through the
-# forwarded header and the loopback Host, and "insecure" needs a Host that is not
+# operator switch and the loopback Host, and "insecure" needs a Host that is not
 # loopback - LWP and raw_request supply one, since Test::Nginx's default is localhost.
 
 use Test::Nginx::Socket 'no_plan';
@@ -32,17 +38,26 @@ use LWP::UserAgent;
 my $ua = LWP::UserAgent->new(timeout => 10);
 my $url = 'http://127.0.0.1:1984/t';
 
-open my $out_fh, '>', 't/servroot/logs/perl.init.log' or die $!;
-
+# die, not print-to-a-file-then-exit: Test::Nginx wraps --- init in an eval and turns a
+# die into a reported block failure carrying the message. The old form put the reason in
+# t/servroot/logs/ (truncated next run, root-owned in the container) and exited, which
+# abandoned 27b and 27c as well. This file's most security-relevant assertion - that a
+# client-supplied X-Forwarded-Proto is NOT honoured - reports through here.
 sub fail {
-    print $out_fh "$_[0]\n";
-    exit 1;
+    die "TEST 27: $_[0]\n";
 }
 
 sub probe {
     my ($key) = @_;
     my $r = $ua->get("http://127.0.0.1:1984/_dict?key=$key");
     fail("could not read the altcha dict: HTTP " . $r->code) unless $r->is_success;
+    return $r->decoded_content;
+}
+
+sub cache_probe {
+    my ($key) = @_;
+    my $r = $ua->get("http://127.0.0.1:1984/_cache?key=$key");
+    fail("could not read crowdsec_cache: HTTP " . $r->code) unless $r->is_success;
     return $r->decoded_content;
 }
 
@@ -59,6 +74,17 @@ fail("the insecure-context page was not served")
 fail("a plain-HTTP request was served the captcha widget")
     if $resp->decoded_content =~ /<altcha-widget/;
 
+# The gate has to run before the VERIFY_STATE entry is written, not after. crowdsec_cache
+# is the same shared dict that holds the decision cache, so one entry per bounced address
+# for a captcha that was refused is an attacker-paced write competing with the decisions
+# the bouncer exists to enforce - and once it exists, every later request from that
+# address reads its body and runs validateCaptcha() to conclude there is nothing to
+# validate, logging "Invalid captcha from" for a visitor who was never offered one.
+#
+# Same shape as the two altcha_* probes below, which prove the mint budget is not charged.
+fail("a refused captcha still wrote a verify entry: " . cache_probe('captcha_1.1.1.1'))
+    unless cache_probe('captcha_1.1.1.1') =~ /^absent/;
+
 # The gate has to run before the challenge is minted: a challenge the visitor can
 # never see must not be derived (that is nginx CPU) nor charged against the mint
 # budget (eleven of these would turn an honest visitor's next captcha into a ban).
@@ -68,16 +94,48 @@ for my $key (qw(altcha_challenge_1.1.1.1 altcha_mints_1.1.1.1)) {
         unless $got =~ /^absent/;
 }
 
-# --- same host, TLS terminated upstream: the widget ------------------------------
+# --- X-Forwarded-Proto is NOT consulted -----------------------------------------
+# The regression test for removing that branch. A client can send this header, and
+# nothing here can distinguish it from one a trusted proxy set, so honouring it would
+# let any visitor on a plaintext vhost choose a scriptable challenge over a denial.
 $req = HTTP::Request->new(GET => $url);
 $req->header(Host => 'plainhttp.example');
 $req->header('X-Forwarded-For' => '1.1.1.1');
 $req->header('X-Forwarded-Proto' => 'https');
 $resp = $ua->request($req);
 
-fail("X-Forwarded-Proto: https was not honoured, got HTTP " . $resp->code)
+fail("X-Forwarded-Proto was honoured, got HTTP " . $resp->code . " - the gate must ignore it")
+    unless $resp->code == 403;
+fail("a client-supplied X-Forwarded-Proto was served the captcha widget")
+    if $resp->decoded_content =~ /<altcha-widget/;
+
+# The hint that names $crowdsec_assume_secure is at ERR, and this header's shape is
+# exactly the misconfiguration it diagnoses - so a flood of them would be a flood of
+# ERR lines. It is latched per worker. Two more requests, then the count has to be one.
+for (1 .. 2) {
+    my $again = HTTP::Request->new(GET => $url);
+    $again->header(Host => 'plainhttp.example');
+    $again->header('X-Forwarded-For' => '1.1.1.1');
+    $again->header('X-Forwarded-Proto' => 'https');
+    $ua->request($again);
+}
+my $hints = $ua->get('http://127.0.0.1:1984/_hintcount');
+fail("could not count the upgrade hint: HTTP " . $hints->code) unless $hints->is_success;
+fail("three X-Forwarded-Proto requests logged the upgrade hint "
+    . $hints->decoded_content . " times, expected 1 - the per-worker latch is not held")
+    unless $hints->decoded_content eq '1';
+
+# --- same host, TLS terminated upstream, declared by the operator: the widget -----
+# $crowdsec_assume_secure is the documented replacement for the header above, and
+# this is its only coverage anywhere in the suite.
+$req = HTTP::Request->new(GET => 'http://127.0.0.1:1984/assume');
+$req->header(Host => 'plainhttp.example');
+$req->header('X-Forwarded-For' => '1.1.1.1');
+$resp = $ua->request($req);
+
+fail("\$crowdsec_assume_secure was not honoured, got HTTP " . $resp->code)
     unless $resp->code == 200;
-fail("expected the captcha widget behind an upstream TLS terminator")
+fail("expected the captcha widget where the operator asserted a secure context")
     unless $resp->decoded_content =~ /<altcha-widget/;
 
 # the positive control for the probes above: minting resumes once the context is
@@ -97,8 +155,6 @@ fail("a loopback origin was refused the captcha, got HTTP " . $resp->code)
 fail("expected the captcha widget on a loopback origin")
     unless $resp->decoded_content =~ /<altcha-widget/;
 
-print $out_fh "Gated on plainhttp.example, served via XFP and loopback.\n";
-close $out_fh or warn "Could not close filehandle: $!";
 
 --- main_config
 load_module /usr/share/nginx/modules/ndk_http_module.so;
@@ -153,8 +209,44 @@ location = /t {
     }
 }
 
+# Counts the upgrade diagnostic in the error log. The --- error_log section below only
+# proves the line appears; the hint is meant to fire once per worker, and presence alone
+# cannot tell that from once per request.
+location = /_hintcount {
+    content_by_lua_block {
+        local fh = io.open(ngx.config.prefix() .. "logs/error.log", "r")
+        if fh == nil then ngx.print("nolog") return end
+        local n = 0
+        for line in fh:lines() do
+            if line:find("crowdsec_assume_secure 1", 1, true) ~= nil then n = n + 1 end
+        end
+        fh:close()
+        ngx.print(n)
+    }
+}
+
+# Same as /t, plus the operator's assertion that this vhost is reached over HTTPS.
+# The only place in the suite where $crowdsec_assume_secure is set at all.
+location = /assume {
+    set $crowdsec_assume_secure 1;
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("PROTECTED")
+    }
+}
+
 # Test-only white-box read of the altcha dict, as in t/25. Probed without an
 # X-Forwarded-For, so it arrives as 127.0.0.1 and the LAPI stub declines to bounce it.
+location = /_cache {
+    content_by_lua_block {
+        local key = ngx.req.get_uri_args()["key"]
+        local v = ngx.shared.crowdsec_cache:get(key)
+        ngx.print(v == nil and "absent" or ("present:" .. tostring(v)))
+    }
+}
+
 location = /_dict {
     content_by_lua_block {
         local key = ngx.req.get_uri_args()["key"]
@@ -175,14 +267,25 @@ Connection: close\r
 
 --- error_code: 403
 --- response_body_like: Verification required
---- error_log
-[Crowdsec] denied '1.1.1.1' with 'captcha'
+--- error_log eval
+[
+"[Crowdsec] denied '1.1.1.1' with 'captcha'",
+# The upgrade diagnostic. The two per-request lines about plain HTTP are at INFO, below
+# nginx's default error_log level, so on a real deployment neither is visible; this one
+# is at ERR and names the fix. Emitted once per worker, from the init block's
+# X-Forwarded-Proto request.
+"add `set \$crowdsec_assume_secure 1;`",
+]
 --- grep_error_log eval
 qr/captcha for '1\.1\.1\.1' cannot run over plain HTTP, serving the insecure-context page instead/
-# Twice: the init block's first request and the raw request above. The XFP and
-# loopback requests must not add one - that they are missing here is the assertion
-# that neither was gated.
+# Five times: the init block's first request, its three X-Forwarded-Proto requests, and
+# the raw request above. The XFP ones being counted here are the assertion that the
+# header is no longer consulted; the loopback and $crowdsec_assume_secure requests must
+# NOT add one, and their absence is the assertion that both still pass the gate.
 --- grep_error_log_out
+captcha for '1.1.1.1' cannot run over plain HTTP, serving the insecure-context page instead
+captcha for '1.1.1.1' cannot run over plain HTTP, serving the insecure-context page instead
+captcha for '1.1.1.1' cannot run over plain HTTP, serving the insecure-context page instead
 captcha for '1.1.1.1' cannot run over plain HTTP, serving the insecure-context page instead
 captcha for '1.1.1.1' cannot run over plain HTTP, serving the insecure-context page instead
 --- no_error_log

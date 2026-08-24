@@ -392,3 +392,86 @@ GET /t
 --- error_log
 [Crowdsec] denied '1.1.1.1' with 'ban'
 
+
+
+=== TEST 24f: a captcha fallback for a broken captcha provider is reconciled at startup
+
+FALLBACK_REMEDIATION=captcha is a valid, documented value, and it is the one value the
+fallback chain in Allow() cannot serve: with captcha_ok false it rewrites captcha to
+captcha, the ban arm does not match, the challenge arm does not match, the captcha arm
+is itself gated on captcha_ok, and the request falls out of the bottom to
+ngx.exit(ngx.DECLINED). Allowed, with no log line, for as long as the provider stays
+broken - and with OVERRIDE_REMEDIATION=captcha, as here, that is every ban the LAPI
+returns rather than only captcha decisions.
+
+24d pins the ordering that makes the fallback fire. This pins the fallback being
+serviceable in the first place, which is a separate thing: the documented promise is
+that an unusable captcha "degrades to FALLBACK_REMEDIATION", and degrading to
+something unservable is not degrading. csmod.init() therefore forces the fallback to
+ban and says so, once, where a configuration problem belongs.
+
+--- main_config
+load_module /usr/share/nginx/modules/ndk_http_module.so;
+load_module /usr/share/nginx/modules/ngx_http_lua_module.so;
+
+--- http_config
+
+lua_package_path './lib/?.lua;;';
+lua_shared_dict crowdsec_cache 50m;
+lua_shared_dict crowdsec_altcha 10m;
+lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
+init_by_lua_block
+{
+        cs = require "crowdsec"
+        local ok, err = cs.init("./t/conf_t/24f_fallback_captcha_broken_provider_crowdsec_nginx_bouncer.conf", "crowdsec-nginx-bouncer/v1.0.8")
+        if ok == nil then
+                ngx.log(ngx.ERR, "[Crowdsec] " .. err)
+                error()
+        end
+        ngx.log(ngx.ALERT, "[Crowdsec] Initialisation done")
+}
+
+access_by_lua_block {
+        local cs = require "crowdsec"
+        cs.Allow(ngx.var.remote_addr)
+}
+
+server {
+    listen 8081;
+
+      location = /v1/decisions {
+            content_by_lua_block {
+            local args, err = ngx.req.get_uri_args()
+            if args.ip == "1.1.1.1" then
+               ngx.say('[{"duration":"1h00m00s","id":4091593,"origin":"CAPI","scenario":"crowdsecurity/vpatch-CVE-2024-4577","scope":"Ip","type":"ban","value":"1.1.1.1"}]')
+            else
+               ngx.print('null')
+            end
+            }
+      }
+}
+
+--- config
+
+location = /t {
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("ok")
+    }
+}
+
+--- more_headers
+X-Forwarded-For: 1.1.1.1
+
+--- request
+GET /t
+
+--- error_code: 403
+--- error_log eval
+[
+"FALLBACK_REMEDIATION is 'captcha' but no captcha can be served",
+"[Crowdsec] denied '1.1.1.1' with 'ban'",
+]

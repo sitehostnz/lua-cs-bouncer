@@ -181,6 +181,7 @@ GET /.crowdsec/altcha-test.js
 --- response_body_like: customElements\.define\("altcha-widget"
 --- response_headers
 Content-Type: application/javascript; charset=utf-8
+Content-Length: 368
 --- no_error_log
 serving the widget from the CDN instead
 
@@ -250,7 +251,7 @@ GET /t
 --- error_code: 200
 --- response_body_like: integrity="sha256-[A-Za-z0-9+/=]+" crossorigin="anonymous"
 --- no_error_log
-serving the widget from the CDN instead
+serving the altcha widget from
 
 
 
@@ -323,3 +324,173 @@ GET /t
 --- response_body_like: cdn\.jsdelivr\.net
 --- error_log
 cannot be read, serving the widget from the CDN instead
+
+
+=== TEST 29d: a percent sign in the widget path is refused, and nginx still starts
+
+ALTCHA_WIDGET_PATH is interpolated into the script tag and that string goes through
+template.compile(), which does template_str:gsub(var, v) with this value in the
+replacement position. Lua reads '%' there as a capture reference, so anything but
+'%%' raises - and this runs inside csmod.init() inside init_by_lua, so unguarded it
+does not degrade the provider, it stops nginx starting on every vhost. A
+percent-encoded path is a plausible thing to paste in, since that is the form a
+browser address bar shows.
+
+That this block runs at all is most of the assertion: nginx came up. The rest pins
+the failure landing where its neighbours land - a line in the log and the CDN copy -
+rather than anywhere new. Nothing is lost by refusing it either, because
+ServeWidget() compares the path against ngx.var.uri, which nginx has already
+percent-decoded, so it could never have matched a request.
+
+The integrity attribute below is the CDN shape 29b asserts for an unset pair, so it
+is also what "fell back" looks like from the page.
+
+--- main_config
+load_module /usr/share/nginx/modules/ndk_http_module.so;
+load_module /usr/share/nginx/modules/ngx_http_lua_module.so;
+
+--- http_config
+
+lua_package_path './lib/?.lua;;';
+lua_shared_dict crowdsec_cache 50m;
+lua_shared_dict crowdsec_altcha 10m;
+lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
+init_by_lua_block
+{
+        cs = require "crowdsec"
+        local ok, err = cs.init("./t/conf_t/29d_widget_path_percent_crowdsec_nginx_bouncer.conf", "crowdsec-nginx-bouncer/v1.0.8")
+        if ok == nil then
+                ngx.log(ngx.ERR, "[Crowdsec] " .. err)
+                error()
+        end
+        ngx.log(ngx.ALERT, "[Crowdsec] Initialisation done")
+}
+
+access_by_lua_block {
+        local cs = require "crowdsec"
+        cs.Allow(ngx.var.remote_addr)
+}
+
+server {
+    listen 8081;
+
+      location = /v1/decisions {
+            content_by_lua_block {
+            local args, err = ngx.req.get_uri_args()
+            if args.ip == "1.1.1.1" then
+               ngx.say('[{"duration":"1h00m00s","id":4091593,"origin":"CAPI","scenario":"crowdsecurity/vpatch-CVE-2024-4577","scope":"Ip","type":"captcha","value":"1.1.1.1"}]')
+            else
+               ngx.print('null')
+            end
+            }
+      }
+}
+
+--- config
+
+location = /t {
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("PROTECTED")
+    }
+}
+
+--- more_headers
+X-Forwarded-For: 1.1.1.1
+
+--- request
+GET /t
+
+--- error_code: 200
+--- response_body_like: integrity="sha256-[A-Za-z0-9+/=]+" crossorigin="anonymous"
+--- error_log
+must not contain '%', '?' or '#', serving the widget from the CDN instead
+
+
+=== TEST 29e: a percent sign in a config value reaching a template does not stop nginx
+
+template.compile() puts every value from template_data in the replacement position of a
+gsub, where Lua reads '%' followed by a digit as a capture reference and raises "invalid
+capture index" on anything else - lazily, only when the placeholder is actually present.
+Every one of those values is operator-supplied configuration, and this runs inside
+init_by_lua, so one stray '%' in one setting stops nginx starting on every vhost.
+
+29d covers the same failure for ALTCHA_WIDGET_PATH, but it covers it by refusing the
+value before it is interpolated, which means the escaping in template.compile() itself is
+exercised by nothing. This block is the one that pins the escaping: SITE_KEY is unused by
+altcha but is still substituted, and t/assets_t/captcha_sitekey.html is a minimal template
+that references it.
+
+SITE_KEY is 'a%2b' rather than 'a%b' on purpose: Lua only raises for '%' followed by a
+digit ("invalid capture index"), and silently drops the '%' otherwise - measured, 'a%b'
+renders as 'ab'. The digit form is the one that stops nginx starting, so it is the one
+worth pinning; the silent-corruption form fails the same body assertion anyway.
+
+That this block runs at all is most of the assertion - nginx came up. The body check is
+the rest: the percent has to survive into the page literally, not as a capture reference
+and not doubled.
+
+--- main_config
+load_module /usr/share/nginx/modules/ndk_http_module.so;
+load_module /usr/share/nginx/modules/ngx_http_lua_module.so;
+
+--- http_config
+
+lua_package_path './lib/?.lua;;';
+lua_shared_dict crowdsec_cache 50m;
+lua_shared_dict crowdsec_altcha 10m;
+lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
+init_by_lua_block
+{
+        cs = require "crowdsec"
+        local ok, err = cs.init("./t/conf_t/29e_sitekey_percent_crowdsec_nginx_bouncer.conf", "crowdsec-nginx-bouncer/v1.0.8")
+        if ok == nil then
+                ngx.log(ngx.ERR, "[Crowdsec] " .. err)
+                error()
+        end
+        ngx.log(ngx.ALERT, "[Crowdsec] Initialisation done")
+}
+
+access_by_lua_block {
+        local cs = require "crowdsec"
+        cs.Allow(ngx.var.remote_addr)
+}
+
+server {
+    listen 8081;
+
+      location = /v1/decisions {
+            content_by_lua_block {
+            local args, err = ngx.req.get_uri_args()
+            if args.ip == "1.1.1.1" then
+               ngx.say('[{"duration":"1h00m00s","id":4091595,"origin":"CAPI","scenario":"crowdsecurity/vpatch-CVE-2024-4577","scope":"Ip","type":"captcha","value":"1.1.1.1"}]')
+            else
+               ngx.print('null')
+            end
+            }
+      }
+}
+
+--- config
+
+location = /t {
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("PROTECTED")
+    }
+}
+
+--- more_headers
+X-Forwarded-For: 1.1.1.1
+
+--- request
+GET /t
+
+--- error_code: 200
+--- response_body_like: <p id="sitekey">a%2b</p>
