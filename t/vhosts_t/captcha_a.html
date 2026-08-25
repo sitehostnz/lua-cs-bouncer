@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><title>VHOST-A CAPTCHA PAGE</title></head>
+<body>
+  <h1>VHOST-A CAPTCHA PAGE</h1>
+  {{captcha_frontend_js_tag}}
+  <form action="" method="POST" id="captcha-form">
+    {{captcha_widget}}
+  </form>
+  <script>
+    function captchaCallback() {
+      document.getElementById('captcha-form').submit();
+    }
+  </script>
+</body>
+</html>

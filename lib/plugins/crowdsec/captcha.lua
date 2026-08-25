@@ -51,6 +51,30 @@ captcha_frontend_key["altcha"] = "altcha"
 -- Anything unique to this file will do; it never reaches the browser.
 local ALTCHA_CHALLENGE_PLACEHOLDER = "__CROWDSEC_ALTCHA_CHALLENGE__"
 
+-- Splits a compiled page around the challenge slot. Returns head and tail, or
+-- nils and a reason (a phrase that reads with a path or 'it' after it) when the
+-- page does not carry exactly one widget. Shared by M.New(), which refuses to
+-- start on a bad stock template, and by the per-vhost path in M.apply(), which
+-- falls back to the stock page instead - a request is not the place to take the
+-- captcha down.
+local function split_altcha_view(view)
+    local at = view:find(ALTCHA_CHALLENGE_PLACEHOLDER, 1, true)
+    if at == nil then
+        return nil, nil, "renders no altcha widget, add {{captcha_widget}} to"
+    end
+    -- Splitting at the first hit leaves any later one verbatim in the tail, so a
+    -- second widget reaches the browser with the placeholder still in its
+    -- challenge attribute. That does not start with '{', so the widget reads it
+    -- as a URL to fetch a challenge from and errors on a path that does not
+    -- exist - and the duplicate id makes the verified listener bind to whichever
+    -- element parses first. Nothing about that is diagnosable from the page, so
+    -- refuse instead.
+    if view:find(ALTCHA_CHALLENGE_PLACEHOLDER, at + #ALTCHA_CHALLENGE_PLACEHOLDER, true) ~= nil then
+        return nil, nil, "renders more than one altcha widget, leave a single {{captcha_widget}} in"
+    end
+    return view:sub(1, at - 1), view:sub(at + #ALTCHA_CHALLENGE_PLACEHOLDER)
+end
+
 -- Per-worker latch for the upgrade hint below. Module state, so it resets on reload,
 -- which is when an operator is most likely to want it again.
 local forwarded_proto_hint_logged = false
@@ -273,6 +297,10 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
             '" data-sitekey="' .. M.SiteKey .. '" data-callback="captchaCallback"></div>'
     end
 
+    -- kept for the per-vhost path in M.apply(), which compiles a host's own page
+    -- with these same substitutions at serve time
+    M.TemplateData = template_data
+
     local view = template.compile(captcha_template, template_data)
 
     -- template.compile() iterates the data, not the template, so a placeholder with
@@ -301,31 +329,19 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
         -- Split once here so serving a challenge is a couple of buffer writes,
         -- rather than a substitution across the whole page - the stock template
         -- inlines its CSS and runs to about 20 kB.
-        local at = view:find(ALTCHA_CHALLENGE_PLACEHOLDER, 1, true)
-        if at == nil then
-            -- Both error returns below leave the provider unusable, and
-            -- csmod.Allow() calls ServeWidget() ahead of every gate it has. Without
-            -- clearing the pair the bundle keeps being served, on every vhost, for a
-            -- provider the bouncer has already declared it cannot use - which is
-            -- most of the way to undiagnosable from the outside.
+        local head, tail, why = split_altcha_view(view)
+        if head == nil then
+            -- This error return leaves the provider unusable, and csmod.Allow()
+            -- calls ServeWidget() ahead of every gate it has. Without clearing the
+            -- pair the bundle keeps being served, on every vhost, for a provider the
+            -- bouncer has already declared it cannot use - which is most of the way
+            -- to undiagnosable from the outside.
             M.WidgetPath = ""
             M.WidgetBody = ""
-            return "captcha template renders no altcha widget, add {{captcha_widget}} to " .. TemplateFilePath
+            return "captcha template " .. why .. " " .. TemplateFilePath
         end
-        -- Splitting at the first hit leaves any later one verbatim in the tail, so a
-        -- second widget reaches the browser with the placeholder still in its
-        -- challenge attribute. That does not start with '{', so the widget reads it
-        -- as a URL to fetch a challenge from and errors on a path that does not
-        -- exist - and the duplicate id makes the verified listener bind to whichever
-        -- element parses first. Nothing about that is diagnosable from the page, so
-        -- refuse here instead.
-        if view:find(ALTCHA_CHALLENGE_PLACEHOLDER, at + #ALTCHA_CHALLENGE_PLACEHOLDER, true) ~= nil then
-            M.WidgetPath = ""
-            M.WidgetBody = ""
-            return "captcha template renders more than one altcha widget, leave a single {{captcha_widget}} in " .. TemplateFilePath
-        end
-        M.TemplateHead = view:sub(1, at - 1)
-        M.TemplateTail = view:sub(at + #ALTCHA_CHALLENGE_PLACEHOLDER)
+        M.TemplateHead = head
+        M.TemplateTail = tail
     end
 
     return nil
@@ -500,7 +516,11 @@ function M.apply(remote_ip, ret_code)
                     "captcha decision here stays a denial. Logged once per worker")
             end
         end
-        if M.InsecureTemplate ~= "" then
+        -- Per-vhost override via `set $crowdsec_captcha_insecure_template <path>;`,
+        -- served raw like the global one: the insecure page carries no widget, so
+        -- there is nothing to compile or validate in a host's own copy.
+        local insecure_page = utils.template_override(ngx.var.crowdsec_captcha_insecure_template) or M.InsecureTemplate
+        if insecure_page ~= "" then
             -- INFO, not ERR: on a site serving plain HTTP this is the routine
             -- outcome for every bounced request, and a bot hammering one endpoint
             -- must not be able to bury genuine errors. The no-page branch below
@@ -517,7 +537,7 @@ function M.apply(remote_ip, ret_code)
             ngx.header.content_type = "text/html"
             ngx.header.cache_control = "no-cache"
             ngx.status = status
-            ngx.say(M.InsecureTemplate)
+            ngx.say(insecure_page)
             ngx.exit(status)
             return
         end
@@ -551,14 +571,38 @@ function M.apply(remote_ip, ret_code)
         end
     end
 
+    -- Per-vhost override via `set $crowdsec_captcha_template <path>;`, compiled
+    -- per serve. Unlike the ban page this is not just a read - the widget markup
+    -- has to be substituted in, and for altcha the page must carry exactly one
+    -- challenge slot - so a host's broken page degrades to the stock one, loudly,
+    -- rather than to a widget that cannot work. The compile is a few string
+    -- passes; hosts without an override stay on the head/tail buffers prepared at
+    -- init and pay only the variable read.
+    local head, tail, body = M.TemplateHead, M.TemplateTail, M.Template
+    local override = utils.template_override(ngx.var.crowdsec_captcha_template)
+    if override ~= nil then
+        local view = template.compile(override, M.TemplateData)
+        if M.CaptchaProvider == "altcha" then
+            local override_head, override_tail, why = split_altcha_view(view)
+            if override_head == nil then
+                ngx.log(ngx.ERR, "per-vhost captcha template for '" .. tostring(ngx.var.host) ..
+                    "' " .. why .. " it, serving the stock captcha page instead")
+            else
+                head, tail = override_head, override_tail
+            end
+        else
+            body = view
+        end
+    end
+
     ngx.header.content_type = "text/html"
     ngx.header.cache_control = "no-cache"
     ngx.status = M.ret_code
 
     if challenge ~= nil then
-        ngx.say({M.TemplateHead, challenge, M.TemplateTail})
+        ngx.say({head, challenge, tail})
     else
-        ngx.say(M.Template)
+        ngx.say(body)
     end
 
     ngx.exit(M.ret_code)

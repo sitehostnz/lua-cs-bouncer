@@ -56,6 +56,35 @@ function M.file_exist(path)
  end
 end
 
+--- The contents of a per-vhost template override, or nil when none applies. path
+--- is the value of a $crowdsec_*_template nginx variable: config-authored via
+--- `set` in the vhost's server block, so it is trusted the way any nginx
+--- directive is. The one exception is that `set` interpolates runtime variables,
+--- and a config that splices $host into the path hands the client a say in it -
+--- refusing '..' keeps that authorship mistake from becoming a traversal.
+--- A missing file is the normal state, not an error: a generated config sets the
+--- path for every vhost, and only hosts whose operator uploaded a page have one.
+function M.template_override(path)
+   if path == nil or path == "" then
+      return nil
+   end
+   if path:find("..", 1, true) ~= nil then
+      ngx.log(ngx.ERR, "refusing per-vhost template override '" .. path ..
+         "': paths containing '..' are not served")
+      return nil
+   end
+   if M.file_exist(path) ~= true then
+      return nil
+   end
+   -- an empty file falls back too: "" is truthy in Lua, so without this a caller's
+   -- `override or global` would serve a blank page instead of the global template
+   local content = M.read_file(path)
+   if content == nil or content == "" then
+      return nil
+   end
+   return content
+end
+
 function M.starts_with(str, start)
     return str:sub(1, #start) == start
  end

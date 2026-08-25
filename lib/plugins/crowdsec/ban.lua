@@ -60,11 +60,23 @@ function M.apply(...)
         ngx.redirect(M.redirect_location)
         return
     end
-    if M.template_str ~= "" then
+
+    -- Per-vhost override: the file named by `set $crowdsec_ban_template <path>;`
+    -- in the vhost's server block, following the $crowdsec_enable_bouncer pattern.
+    -- Read on every ban rather than cached - one small page-cache-warm read, the
+    -- same cost nginx pays serving any static file - so an edited page takes
+    -- effect immediately, with no reload and nothing to invalidate. Deliberately
+    -- checked after the redirect: a global REDIRECT_LOCATION is instance-wide
+    -- policy and a host's page must not silently defeat it. Falls back to the
+    -- global template, so a vhost that never sets the variable, or sets a path
+    -- whose file does not exist yet, keeps working unchanged.
+    local body = utils.template_override(ngx.var.crowdsec_ban_template) or M.template_str
+
+    if body ~= "" then
         ngx.header.content_type = "text/html"
         ngx.header.cache_control = "no-cache"
         ngx.status = status
-        ngx.say(M.template_str)
+        ngx.say(body)
         ngx.exit(status)
         return
     end

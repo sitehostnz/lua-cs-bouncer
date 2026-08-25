@@ -160,3 +160,34 @@ declared. The previous `{{captcha_frontend_js}}`, `{{captcha_frontend_key}}` and
 layout keep working with the non-altcha providers — but altcha needs
 `{{captcha_widget}}` and will refuse to start without it. Deploy `lib/` and
 `templates/` together.
+
+### Per-vhost template overrides
+
+Any server block can point the bouncer at its own pages, following the same pattern
+as the `$crowdsec_enable_bouncer` toggles:
+
+```nginx
+set $crowdsec_ban_template              /error_pages/user/example.com/ban.html;
+set $crowdsec_captcha_template          /error_pages/user/example.com/captcha.html;
+set $crowdsec_captcha_insecure_template /error_pages/user/example.com/captcha_insecure.html;
+```
+
+The variables are optional. A vhost that never sets one, sets it empty, or names a
+file that does not exist falls back to the global template from the bouncer config —
+so a generated config can safely name the path for every vhost and let only the
+hosts that actually have a page use it. Files are read per serve, so edits take
+effect immediately, without a reload.
+
+Notes:
+
+- The captcha override is compiled per serve with the same placeholders as
+  `templates/captcha.html`, and for altcha it must carry exactly one
+  `{{captcha_widget}}` — a page without it degrades to the stock captcha page and
+  logs why, rather than serving a widget nobody can solve.
+- The ban and insecure pages are served raw; no placeholders.
+- A global `REDIRECT_LOCATION` still wins over a per-vhost ban page — it is
+  instance-wide policy.
+- Override paths containing `..` are refused. `set` interpolates runtime variables,
+  so a config that splices `$host` into the path hands the client a say in it; the
+  refusal keeps that from becoming a traversal. Prefer paths interpolated at
+  config-generation time.

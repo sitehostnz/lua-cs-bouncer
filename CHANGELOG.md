@@ -12,6 +12,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `$crowdsec_ban_template`, `$crowdsec_captcha_template` and
+  `$crowdsec_captcha_insecure_template` let a `server` block serve its own pages,
+  following the `$crowdsec_enable_bouncer` pattern. An unset variable or a missing file
+  falls back to the global template, and pages are read per serve so edits apply without
+  a reload. (#3)
+- A per-vhost captcha override that does not carry exactly one `{{captcha_widget}}` slot
+  degrades to the stock captcha page, rather than serving a widget nobody can solve. (#3)
+- Override paths containing `..` are refused, so a config that interpolates request data
+  into the path cannot be steered into a traversal. (#3)
 - `CAPTCHA_PROVIDER=altcha`: a self-verifying [ALTCHA](https://altcha.org) proof-of-work
   captcha the bouncer issues and checks itself, with no third-party service or account.
   Tuned with `ALTCHA_COST`, `ALTCHA_COMPLEXITY` and `ALTCHA_ALGORITHM`. Needs the
