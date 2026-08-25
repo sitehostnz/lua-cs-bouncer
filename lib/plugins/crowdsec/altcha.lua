@@ -247,24 +247,14 @@ local PROBE_CLOCK_EVERY = 32
 M.MintsPerSecond = 1
 
 -- Exact mode: ALTCHA_MINTS_PER_SECOND, per worker. Unset - the default - leaves the
--- time budget above to size the rate from what a derivation actually costs here.
+-- budget above to size the rate from what a derivation costs here.
 --
--- The rate is a local in M.New(), not a field on M like M.Cost: nothing outside reads
--- it, and a field assigned only when the setting is present would carry the previous
--- call's mode into a second New() that omits it.
---
--- The paragraph above argues a mint count is meaningless without knowing what a mint
--- costs, and that argument still holds; this is not a retraction of it. What it does not
--- cover is an operator who knows something this process cannot read. The CFS quota noted
--- there is exactly that: nginx counts the host's cores, so a capped container is handed
--- a budget it has no CPU to spend, and nothing in here can measure the shortfall.
--- Stating the rate is the only way to say so.
---
--- Its weakness is the one a count always had, and it stays: the number does not move
--- when ALTCHA_COST or the hardware does, so a later cost rise silently multiplies the
--- time each worker spends deriving. M.New() therefore reports the share the rate
--- implies, and warns twice - past a quarter of a worker second, and past a whole one,
--- where the cap can no longer be reached at all and so bounds nothing.
+-- It exists for what measurement cannot reach: nginx counts the host's cores, so a
+-- CPU-capped container gets a budget it has no CPU to spend, and nothing here can see
+-- the shortfall. A stated rate does not track ALTCHA_COST either, so M.New() prints the
+-- share it implies and warns past a quarter of a worker second, then past a whole one
+-- where the cap bounds nothing. Kept local to M.New(): nothing outside reads it, and a
+-- field would carry one call's mode into the next.
 local EXACT_MINT_WARN_MS = 250
 
 -- We pay one pass of ALTCHA_COST per captcha page served, synchronously, on a worker
