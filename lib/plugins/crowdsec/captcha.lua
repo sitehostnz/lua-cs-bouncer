@@ -103,7 +103,7 @@ M.WidgetBody = ""
 -- M.apply() exists for callers still on the pre-altcha form.
 --
 -- Both are worth revisiting the day this stops tracking upstream, and not before.
-function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code, altcha_cost, altcha_algorithm, altcha_complexity, insecure_template_path, widget_file, widget_path)
+function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code, altcha_cost, altcha_algorithm, altcha_complexity, insecure_template_path, widget_file, widget_path, altcha_mints_per_second)
 
     M.CaptchaProvider = captcha_provider
 
@@ -151,7 +151,7 @@ function M.New(siteKey, secretKey, TemplateFilePath, captcha_provider, ret_code,
       end
       altcha = mod
 
-      local err = altcha.New(altcha_cost, altcha_algorithm, altcha_complexity)
+      local err = altcha.New(altcha_cost, altcha_algorithm, altcha_complexity, altcha_mints_per_second)
       if err ~= nil then
         return err
       end

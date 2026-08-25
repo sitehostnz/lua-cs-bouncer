@@ -145,7 +145,7 @@ function csmod.init(configFile, userAgent)
     runtime.captcha_ok = false
     ngx.log(ngx.NOTICE, "CAPTCHA_PROVIDER is not set, captcha decisions will be served the fallback remediation")
   else
-    local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"], runtime.conf["CAPTCHA_INSECURE_TEMPLATE_PATH"], runtime.conf["ALTCHA_WIDGET_FILE"], runtime.conf["ALTCHA_WIDGET_PATH"])
+    local err = captcha.New(runtime.conf["SITE_KEY"], runtime.conf["SECRET_KEY"], runtime.conf["CAPTCHA_TEMPLATE_PATH"], runtime.conf["CAPTCHA_PROVIDER"], runtime.conf["CAPTCHA_RET_CODE"], runtime.conf["ALTCHA_COST"], runtime.conf["ALTCHA_ALGORITHM"], runtime.conf["ALTCHA_COMPLEXITY"], runtime.conf["CAPTCHA_INSECURE_TEMPLATE_PATH"], runtime.conf["ALTCHA_WIDGET_FILE"], runtime.conf["ALTCHA_WIDGET_PATH"], runtime.conf["ALTCHA_MINTS_PER_SECOND"])
     if err ~= nil then
       ngx.log(ngx.ERR, "error loading captcha plugin: " .. err)
       runtime.captcha_ok = false

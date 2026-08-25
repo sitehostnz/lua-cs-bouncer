@@ -246,6 +246,27 @@ local PROBE_CLOCK_EVERY = 32
 -- budget on a single derivation still serves one captcha per second rather than none.
 M.MintsPerSecond = 1
 
+-- Exact mode: ALTCHA_MINTS_PER_SECOND, per worker. Unset - the default - leaves the
+-- time budget above to size the rate from what a derivation actually costs here.
+--
+-- The rate is a local in M.New(), not a field on M like M.Cost: nothing outside reads
+-- it, and a field assigned only when the setting is present would carry the previous
+-- call's mode into a second New() that omits it.
+--
+-- The paragraph above argues a mint count is meaningless without knowing what a mint
+-- costs, and that argument still holds; this is not a retraction of it. What it does not
+-- cover is an operator who knows something this process cannot read. The CFS quota noted
+-- there is exactly that: nginx counts the host's cores, so a capped container is handed
+-- a budget it has no CPU to spend, and nothing in here can measure the shortfall.
+-- Stating the rate is the only way to say so.
+--
+-- Its weakness is the one a count always had, and it stays: the number does not move
+-- when ALTCHA_COST or the hardware does, so a later cost rise silently multiplies the
+-- time each worker spends deriving. M.New() therefore reports the share the rate
+-- implies, and warns twice - past a quarter of a worker second, and past a whole one,
+-- where the cap can no longer be reached at all and so bounds nothing.
+local EXACT_MINT_WARN_MS = 250
+
 -- We pay one pass of ALTCHA_COST per captcha page served, synchronously, on a worker
 -- that cannot yield partway through a derivation - so a mistyped cost is a self
 -- inflicted stall rather than merely a slow page. At the 5000 default a derivation is
@@ -390,7 +411,7 @@ local function equal(a, b)
 end
 
 --- Validates configuration. Returns an error string, or nil when usable.
-function M.New(cost, algorithm, complexity)
+function M.New(cost, algorithm, complexity, mints_per_second)
     -- Refused rather than advised. The old fallback shared crowdsec_cache with the
     -- decision cache, and challenges are attacker-paced writes: every fresh bounced
     -- address mints entries there, so a rotating source could churn the dict and
@@ -470,6 +491,25 @@ function M.New(cost, algorithm, complexity)
         M.Complexity = math.floor(complexity)
     end
 
+    -- Deliberately no upper bound. Exact mode exists to override our arithmetic, and a
+    -- ceiling here would be that arithmetic again wearing a different hat; the two
+    -- warnings in the calibration below carry the cost instead.
+    -- Nil selects the calibrated budget below.
+    local mints_per_worker = nil
+    if mints_per_second ~= nil and mints_per_second ~= "" then
+        mints_per_second = tonumber(mints_per_second)
+        -- Finite, not just "at least 1": tonumber() accepts "nan" and "inf", and both
+        -- pass < 1, then make the cap comparison in Challenge() false for every counter
+        -- value - so the budget would bound nothing. -inf is under 1 already.
+        if mints_per_second == nil or mints_per_second ~= mints_per_second
+            or mints_per_second == math.huge or mints_per_second < 1 then
+            return "ALTCHA_MINTS_PER_SECOND must be a finite number of challenges per " ..
+                "worker per second, at least 1, or unset to size the rate from a " ..
+                "measurement of this host"
+        end
+        mints_per_worker = math.floor(mints_per_second)
+    end
+
     -- Fail at init rather than on the first bounced request. This also proves the
     -- shipped lua-resty-openssl can reach the chosen algorithm at all, which is
     -- worth checking per algorithm rather than once: they take different paths
@@ -510,8 +550,44 @@ function M.New(cost, algorithm, complexity)
     end
     local per_mint_ms = elapsed_ms / minted
     local workers = ngx.worker.count() or 1
-    local budget_ms = MINT_BUDGET_MS_PER_WORKER_SECOND * workers
 
+    -- Exact mode. The calibration still ran - it is what proves the rocks reach the
+    -- algorithm - but from here it only reports. The rate is applied as given even when
+    -- it is plainly too high: stating one says you know this host better than a 5%
+    -- default does, so the warnings below price it rather than clamp it.
+    if mints_per_worker ~= nil then
+        M.MintsPerSecond = mints_per_worker * workers
+        local implied_ms = mints_per_worker * per_mint_ms
+        ngx.log(ngx.NOTICE, "altcha: ALTCHA_MINTS_PER_SECOND=", mints_per_worker,
+            " caps minting at ", M.MintsPerSecond, " challenges per second across ",
+            workers, " worker(s); a key derivation at ALTCHA_COST=", M.Cost,
+            " costs about ", string.format("%.3f", per_mint_ms),
+            " ms here, so that rate spends ", string.format("%.0f", implied_ms),
+            " ms of every worker second (", string.format("%.0f", implied_ms / 10),
+            "%) deriving; above the cap, captcha decisions degrade to FALLBACK_REMEDIATION")
+
+        if implied_ms > 1000 then
+            ngx.log(ngx.ERR, "ALTCHA_MINTS_PER_SECOND=" .. mints_per_worker ..
+                " is more than a worker can mint: it asks for " ..
+                string.format("%.0f", implied_ms) .. " ms of key derivation per worker " ..
+                "second at ALTCHA_COST=" .. M.Cost .. ", so the cap cannot be reached " ..
+                "and nothing bounds minting in practice - a flood saturates the workers " ..
+                "rather than being refused. Lower it, or lower ALTCHA_COST.")
+        elseif implied_ms > EXACT_MINT_WARN_MS then
+            ngx.log(ngx.ERR, "ALTCHA_MINTS_PER_SECOND=" .. mints_per_worker ..
+                " spends " .. string.format("%.0f", implied_ms / 10) .. "% of every " ..
+                "worker second on key derivation, against the " ..
+                string.format("%.0f", MINT_BUDGET_MS_PER_WORKER_SECOND / 10) .. "% the " ..
+                "self-calibrating default spends. A derivation cannot yield, so that " ..
+                "share is added latency for every other request on that worker. Note " ..
+                "the rate does not track ALTCHA_COST: raising the cost raises this " ..
+                "share in step, with nothing in the configuration to show it.")
+        end
+
+        return nil
+    end
+
+    local budget_ms = MINT_BUDGET_MS_PER_WORKER_SECOND * workers
     M.MintsPerSecond = math.max(1, math.floor(budget_ms / per_mint_ms))
     ngx.log(ngx.NOTICE, "altcha: a key derivation at ALTCHA_COST=", M.Cost, " costs about ",
         string.format("%.3f", per_mint_ms), " ms here, so minting is capped at ",
