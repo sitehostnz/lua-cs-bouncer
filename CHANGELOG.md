@@ -8,7 +8,14 @@ entries describe the fork's changes relative to upstream.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [2026.08.26-v1.0.17]
+
+### Added
+
+- `ALTCHA_MINTS_PER_SECOND` replaces the calibrated altcha mint budget with a stated
+  rate per worker, for hosts whose real CPU limit the calibration cannot see. (#2)
+
+## [2026.08.24-v1.0.16]
 
 ### Added
 

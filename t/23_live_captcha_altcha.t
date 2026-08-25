@@ -883,3 +883,183 @@ GET /t
 altcha mint budget exhausted
 --- no_error_log
 altcha mint limit reached
+
+
+=== TEST 23f: ALTCHA_MINTS_PER_SECOND replaces the calibrated budget
+
+Exact mode. 23d and 23e cover what the cap does once it is reached; this block covers
+only where the number comes from, because that is the part the setting changes.
+
+ALTCHA_COST is 100 here, where a derivation costs a fraction of a millisecond and the
+calibrated budget lands in the thousands. A cap of 3 therefore cannot be a measurement
+that happened to agree - it can only be the configured rate. The startup line is
+asserted alongside it, since it is what an operator reads to find out what share of a
+worker the rate actually bought.
+
+The rate is per worker and Test::Nginx runs one, so the configured rate and the
+resulting cap are the same number here.
+
+--- init
+
+use LWP::UserAgent;
+
+sub fail_23f { die "TEST 23f: $_[0]\n" }
+
+my $ua = LWP::UserAgent->new;
+my $probe = $ua->get('http://127.0.0.1:1984/_budget');
+fail_23f('/_budget: HTTP ' . $probe->code) unless $probe->is_success;
+
+my $cap = $probe->content;
+fail_23f("MintsPerSecond is '$cap', expected a number") unless $cap =~ /^\d+$/;
+fail_23f("MintsPerSecond is $cap with ALTCHA_MINTS_PER_SECOND=3 and one worker - the "
+    . "configured rate is not reaching the cap, or the calibrated budget still is")
+    unless $cap == 3;
+
+--- main_config
+load_module /usr/share/nginx/modules/ndk_http_module.so;
+load_module /usr/share/nginx/modules/ngx_http_lua_module.so;
+
+--- http_config
+
+lua_package_path './lib/?.lua;;';
+lua_shared_dict crowdsec_cache 50m;
+lua_shared_dict crowdsec_altcha 10m;
+lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
+init_by_lua_block
+{
+        cs = require "crowdsec"
+        local ok, err = cs.init("./t/conf_t/23f_altcha_exact_mints_crowdsec_nginx_bouncer.conf", "crowdsec-nginx-bouncer/v1.0.8")
+        if ok == nil then
+                ngx.log(ngx.ERR, "[Crowdsec] " .. err)
+                error()
+        end
+        ngx.log(ngx.ALERT, "[Crowdsec] Initialisation done")
+}
+
+access_by_lua_block {
+        local cs = require "crowdsec"
+        cs.Allow(ngx.var.remote_addr)
+}
+
+server {
+    listen 8081;
+
+      location = /v1/decisions {
+            content_by_lua_block {
+            local args, err = ngx.req.get_uri_args()
+            if args.ip ~= nil and args.ip:find("^10%.") ~= nil then
+               ngx.say('[{"duration":"1h00m00s","id":4091593,"origin":"CAPI","scenario":"crowdsecurity/vpatch-CVE-2024-4577","scope":"Ip","type":"captcha","value":"' .. args.ip .. '"}]')
+            else
+               ngx.print('null')
+            end
+            }
+      }
+}
+
+--- config
+
+location = /t {
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("ok")
+    }
+}
+
+location = /_budget {
+    content_by_lua_block {
+        ngx.print(require("plugins.crowdsec.altcha").MintsPerSecond)
+    }
+}
+
+--- more_headers
+X-Forwarded-For: 10.7.7.7
+
+--- request
+GET /t
+
+--- error_code: 200
+--- response_body_like: <altcha-widget
+--- error_log
+ALTCHA_MINTS_PER_SECOND=3 caps minting at 3 challenges per second
+
+
+=== TEST 23g: a rate below one challenge per second is refused at startup
+
+The floor is 1 rather than 0 because zero is not a bounded captcha, it is a stopped
+one: every captcha decision would degrade for want of a challenge nobody is allowed to
+mint. Refusing it at init says so once, in the log, instead of once per bounced
+request.
+
+Refused the way every other unusable captcha configuration is - captcha.New() returns
+the error, the provider does not load, and decisions fall to FALLBACK_REMEDIATION. So
+the address below is bounced with a ban, and the widget never appears.
+
+--- main_config
+load_module /usr/share/nginx/modules/ndk_http_module.so;
+load_module /usr/share/nginx/modules/ngx_http_lua_module.so;
+
+--- http_config
+
+lua_package_path './lib/?.lua;;';
+lua_shared_dict crowdsec_cache 50m;
+lua_shared_dict crowdsec_altcha 10m;
+lua_ssl_trusted_certificate /etc/ssl/certs/ca-certificates.crt;
+
+init_by_lua_block
+{
+        cs = require "crowdsec"
+        local ok, err = cs.init("./t/conf_t/23g_altcha_exact_mints_invalid_crowdsec_nginx_bouncer.conf", "crowdsec-nginx-bouncer/v1.0.8")
+        if ok == nil then
+                ngx.log(ngx.ERR, "[Crowdsec] " .. err)
+                error()
+        end
+        ngx.log(ngx.ALERT, "[Crowdsec] Initialisation done")
+}
+
+access_by_lua_block {
+        local cs = require "crowdsec"
+        cs.Allow(ngx.var.remote_addr)
+}
+
+server {
+    listen 8081;
+
+      location = /v1/decisions {
+            content_by_lua_block {
+            local args, err = ngx.req.get_uri_args()
+            if args.ip ~= nil and args.ip:find("^10%.") ~= nil then
+               ngx.say('[{"duration":"1h00m00s","id":4091593,"origin":"CAPI","scenario":"crowdsecurity/vpatch-CVE-2024-4577","scope":"Ip","type":"captcha","value":"' .. args.ip .. '"}]')
+            else
+               ngx.print('null')
+            end
+            }
+      }
+}
+
+--- config
+
+location = /t {
+    set_real_ip_from 127.0.0.1;
+    real_ip_header   X-Forwarded-For;
+    real_ip_recursive on;
+    content_by_lua_block {
+        ngx.print("ok")
+    }
+}
+
+--- more_headers
+X-Forwarded-For: 10.6.6.6
+
+--- request
+GET /t
+
+--- error_code: 403
+--- response_body_unlike: <altcha-widget
+--- error_log eval
+[
+"ALTCHA_MINTS_PER_SECOND must be a finite number of challenges per worker per second",
+"[Crowdsec] denied '10.6.6.6' with 'ban'",
+]

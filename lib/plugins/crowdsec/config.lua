@@ -1,7 +1,7 @@
 local config = {}
 
 local valid_params = {'ENABLED', 'ENABLE_INTERNAL', 'API_URL', 'API_KEY', 'BOUNCING_ON_TYPE', 'MODE', 'SECRET_KEY', 'SITE_KEY', 'BAN_TEMPLATE_PATH' ,'CAPTCHA_TEMPLATE_PATH', 'CAPTCHA_INSECURE_TEMPLATE_PATH', 'ALTCHA_WIDGET_FILE', 'ALTCHA_WIDGET_PATH', 'REDIRECT_LOCATION', 'RET_CODE', 'CAPTCHA_RET_CODE', 'EXCLUDE_LOCATION', 'FALLBACK_REMEDIATION', 'OVERRIDE_REMEDIATION', 'CAPTCHA_PROVIDER', 'ALTCHA_ALGORITHM', 'APPSEC_URL', 'APPSEC_FAILURE_ACTION', 'ALWAYS_SEND_TO_APPSEC', 'APPSEC_DROP_UNREADABLE_BODY', 'SSL_VERIFY', 'USE_TLS_AUTH', 'TLS_CLIENT_CERT', 'TLS_CLIENT_KEY', 'SCENARIOS_CONTAINING', 'SCENARIOS_NOT_CONTAINING'}
-local valid_int_params = {'CACHE_EXPIRATION', 'CACHE_SIZE', 'REQUEST_TIMEOUT', 'UPDATE_FREQUENCY', 'CAPTCHA_EXPIRATION', 'ALTCHA_COST', 'ALTCHA_COMPLEXITY', 'APPSEC_CONNECT_TIMEOUT', 'APPSEC_SEND_TIMEOUT', 'APPSEC_PROCESS_TIMEOUT', 'STREAM_REQUEST_TIMEOUT'}
+local valid_int_params = {'CACHE_EXPIRATION', 'CACHE_SIZE', 'REQUEST_TIMEOUT', 'UPDATE_FREQUENCY', 'CAPTCHA_EXPIRATION', 'ALTCHA_COST', 'ALTCHA_COMPLEXITY', 'ALTCHA_MINTS_PER_SECOND', 'APPSEC_CONNECT_TIMEOUT', 'APPSEC_SEND_TIMEOUT', 'APPSEC_PROCESS_TIMEOUT', 'STREAM_REQUEST_TIMEOUT'}
 -- CACHE_SIZE is not used in the code, but as is was valid parameter for the configuration file, not removing it now
 local valid_bouncing_on_type_values = {'ban', 'captcha', 'all'}
 local valid_truefalse_values = {'false', 'true'}
@@ -26,6 +26,11 @@ local default_values = {
     ['FALLBACK_REMEDIATION'] = "ban",
     ['OVERRIDE_REMEDIATION'] = "",
     ['CAPTCHA_PROVIDER'] = "recaptcha",
+    -- No ALTCHA_MINTS_PER_SECOND default on purpose either, and for a stronger
+    -- reason than ALTCHA_COST's: its absence is not a missing value but a mode. Unset,
+    -- altcha.lua measures this host and sizes the mint rate itself; any default here
+    -- would silently replace that with a fixed number nobody chose.
+    --
     -- No ALTCHA_COST default on purpose. A default set here arrives at altcha.New()
     -- indistinguishable from a value the operator typed, and the sensible default
     -- differs by an order of magnitude between the PBKDF2 and SHA families. altcha.lua

@@ -102,7 +102,8 @@ It also needs two things the other providers do not, both outside `crowdsec.conf
    so a ~300-byte challenge entry occupies a 512-byte slab before the counter is even
    stored.
 
-Tuning (`ALTCHA_COST`, `ALTCHA_COMPLEXITY`, `ALTCHA_ALGORITHM`) is documented inline
+Tuning (`ALTCHA_COST`, `ALTCHA_COMPLEXITY`, `ALTCHA_ALGORITHM`,
+`ALTCHA_MINTS_PER_SECOND`) is documented inline
 in [`config_example.conf`](config_example.conf). The practical ceiling on the first
 two is the widget's own 90 second solve timeout: the bouncer holds the "owes us a
 captcha" state for five minutes from serving the page, and solving starts as the
